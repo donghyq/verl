@@ -19,15 +19,59 @@ from .agent_loop import (
     AgentLoopWorker,
     get_trajectory_info,
 )
+from .search_agent_loop import SearchAgentLoop
+from .search_environment import (
+    InMemorySearchAdapter,
+    RecordingSearchAdapter,
+    SearchAction,
+    SearchAdapter,
+    SearchCost,
+    SearchDocument,
+    SearchObservation,
+    SearchObservationRenderer,
+    SearchSnapshotRecord,
+    SearchSnapshotStore,
+    SearchTrace,
+    SnapshotReplaySearchAdapter,
+    load_snapshot_store,
+)
+from .search_reward import (
+    SearchRewardBatchSummary,
+    SearchRewardBreakdown,
+    SearchRewardComponents,
+    SearchRewardConfig,
+    evaluate_search_reward_batch,
+    summarize_search_reward_batch,
+)
 from .single_turn_agent_loop import SingleTurnAgentLoop
 from .tool_agent_loop import ToolAgentLoop
 
-_ = [SingleTurnAgentLoop, ToolAgentLoop]
+_ = [SingleTurnAgentLoop, ToolAgentLoop, SearchAgentLoop]
 
 __all__ = [
     "AgentLoopBase",
     "AgentLoopManager",
     "AgentLoopWorker",
     "AgentLoopOutput",
+    "InMemorySearchAdapter",
+    "RecordingSearchAdapter",
+    "SearchAction",
+    "SearchAdapter",
+    "SearchAgentLoop",
+    "SearchCost",
+    "SearchDocument",
+    "SearchObservation",
+    "SearchObservationRenderer",
+    "SearchRewardBatchSummary",
+    "SearchRewardBreakdown",
+    "SearchRewardComponents",
+    "SearchRewardConfig",
+    "SearchSnapshotRecord",
+    "SearchSnapshotStore",
+    "SearchTrace",
+    "SnapshotReplaySearchAdapter",
+    "evaluate_search_reward_batch",
     "get_trajectory_info",
+    "load_snapshot_store",
+    "summarize_search_reward_batch",
 ]
