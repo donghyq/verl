@@ -1,0 +1,25 @@
+"""Partial rollout: pause / save / resume / reclaim closed loop (Phase A)."""
+
+from verl.experimental.partial_rollout.rollout_state import (
+    InvalidResumeError,
+    RolloutLifecycle,
+    RolloutState,
+    RolloutStateSnapshot,
+    new_kv_handle,
+    new_request_id,
+)
+from verl.experimental.partial_rollout.partial_rollout_manager import (
+    PartialRolloutManager,
+    RolloutMetrics,
+)
+
+__all__ = [
+    "InvalidResumeError",
+    "RolloutLifecycle",
+    "RolloutState",
+    "RolloutStateSnapshot",
+    "PartialRolloutManager",
+    "RolloutMetrics",
+    "new_kv_handle",
+    "new_request_id",
+]
