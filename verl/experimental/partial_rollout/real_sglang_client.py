@@ -196,9 +196,10 @@ class RealSGLangServer:
 
     def health_check(self) -> bool:
         try:
-            self._get("/health")
-            return True
-        except Exception:
+            resp = requests.get(f"{self.base_url}/health", timeout=self.timeout)
+            return resp.status_code == 200
+        except Exception as e:
+            logger.error(f"health_check failed: {type(e).__name__}: {e}")
             return False
 
     def update_weight_version(self, version: str) -> None:

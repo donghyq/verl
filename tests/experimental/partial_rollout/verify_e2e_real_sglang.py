@@ -186,7 +186,7 @@ def test_concurrent_rollouts(server):
 
 def main():
     ap = argparse.ArgumentParser(description="E2E: VeRL Partial Rollout -> real SGLang")
-    ap.add_argument("--host", default="localhost")
+    ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=30000)
     ap.add_argument("--compare-port", type=int, default=None, help="Second server for comparison")
     args = ap.parse_args()
