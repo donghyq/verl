@@ -97,7 +97,11 @@ class PartialRolloutManager:
         """
         rid = request_id or new_request_id()
         if rid in self._states:
-            raise ValueError(f"request_id {rid!r} already exists")
+            existing = self._states[rid]
+            if not existing.lifecycle.is_terminal:
+                raise ValueError(f"request_id {rid!r} already exists")
+            del self._states[rid]
+            self._resident_kv.pop(rid, None)
         state = RolloutState(
             request_id=rid,
             prompt_ids=list(prompt_ids),
