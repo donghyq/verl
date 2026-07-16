@@ -14,6 +14,7 @@ import json
 import os
 import time
 from typing import Optional
+from urllib.parse import quote, unquote
 
 from verl.experimental.partial_rollout.rollout_state import (
     RolloutState,
@@ -41,7 +42,9 @@ class SnapshotStore:
         os.makedirs(self.root, exist_ok=True)
 
     def _path(self, request_id: str) -> str:
-        safe_name = request_id.replace("/", "_").replace("\\", "_")
+        # Reversible encoding avoids collisions between separators and literal
+        # underscores in request IDs.
+        safe_name = quote(request_id, safe="")
         return os.path.join(self.root, f"{safe_name}.json")
 
     def save(self, snapshot: RolloutStateSnapshot) -> str:
@@ -78,7 +81,7 @@ class SnapshotStore:
         result = []
         for name in os.listdir(self.root):
             if name.endswith(".json"):
-                result.append(name[:-5].replace("_", "/"))
+                result.append(unquote(name[:-5]))
         return sorted(result)
 
     def delete(self, request_id: str) -> bool:

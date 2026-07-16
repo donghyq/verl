@@ -74,6 +74,16 @@ class TestListAndDelete:
         store.save(make_snapshot(rid="r3"))
         assert store.list_paused() == ["r1", "r2", "r3"]
 
+    def test_list_paused_preserves_slashes_and_underscores(self, tmp_path):
+        store = SnapshotStore(str(tmp_path))
+        request_ids = ["tenant_a/request_1", "tenant/a_b", "plain_id"]
+        for request_id in request_ids:
+            store.save(make_snapshot(rid=request_id))
+
+        assert store.list_paused() == sorted(request_ids)
+        for request_id in request_ids:
+            assert store.load(request_id).request_id == request_id
+
     def test_exists(self, tmp_path):
         store = SnapshotStore(str(tmp_path))
         store.save(make_snapshot(rid="r1"))
@@ -190,6 +200,6 @@ class TestPathSafety:
         store = SnapshotStore(str(tmp_path))
         snap = make_snapshot(rid="group/sub-1")
         path = store.save(snap)
-        assert "group_sub-1.json" in path
+        assert "group%2Fsub-1.json" in path
         loaded = store.load("group/sub-1")
         assert loaded.request_id == "group/sub-1"
