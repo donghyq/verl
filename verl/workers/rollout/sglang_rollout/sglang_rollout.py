@@ -15,9 +15,11 @@
 # limitations under the License.
 from __future__ import annotations
 
+import asyncio
 import logging
 import multiprocessing as mp
 import os
+from collections.abc import Mapping
 from typing import Generator
 
 import ray
@@ -114,6 +116,28 @@ sglang.srt.entrypoints.engine._set_envs_and_config = _set_envs_and_config
 
 # because chatCompletion is an async method, it makes the whole ray actor be an async actor
 # which can not call loop.run_until_complete. So we need to make the engine to be an async class
+def _preserved_weight_update_uses_session() -> bool:
+    """Validate native preservation controls before consuming any weight tensors."""
+    from typing import get_args, get_type_hints
+
+    from sglang.srt.managers import io_struct
+
+    try:
+        pause = get_type_hints(io_struct.PauseGenerationReqInput)
+        tensor = get_type_hints(io_struct.UpdateWeightsFromTensorReqInput)
+    except (AttributeError, NameError, TypeError) as exc:
+        raise RuntimeError("Cannot inspect native SGLang preservation controls") from exc
+    if "in_place" not in get_args(pause.get("mode")):
+        raise RuntimeError("Native SGLang does not expose in_place pause")
+    if not {"flush_cache", "abort_all_requests"}.issubset(tensor):
+        raise RuntimeError("Native SGLang tensor update lacks preservation flags")
+    begin = getattr(io_struct, "BeginWeightUpdateReqInput", None) is not None
+    end = getattr(io_struct, "EndWeightUpdateReqInput", None) is not None
+    if begin != end:
+        raise RuntimeError("Native SGLang weight-update session schema is incomplete")
+    return begin
+
+
 class ServerAdapter(BaseRollout):
     """SGLang server adapter used in native http server mode, serve as http client to request SGLang server
     to resume/release/update weights and kv_cache.
@@ -296,6 +320,7 @@ class ServerAdapter(BaseRollout):
         weights: Generator[tuple[str, torch.Tensor], None, None],
         global_steps: int = None,
         wire_format: str = "named_tensors",
+        preserve_kv_cache: bool = False,
         **kwargs,
     ):
         """
@@ -310,7 +335,14 @@ class ServerAdapter(BaseRollout):
             - Main logic: https://github.com/THUDM/slime/blob/fb7605cc5fb09af0f9369d37f7192f12bddee577/slime/ray/ppo_actor.py#L452
             - runtime envs: https://github.com/THUDM/slime/blob/fb7605cc5fb09af0f9369d37f7192f12bddee577/slime/ray/ppo_actor.py#L39
         """
+        if preserve_kv_cache:
+            self._validate_preserved_weight_update(wire_format, kwargs.get("peft_config"))
+            uses_session = _preserved_weight_update_uses_session()
         await self._init_server_adapter()
+
+        if preserve_kv_cache:
+            await self._update_weights_preserving_cache(weights, global_steps, uses_session=uses_session)
+            return
 
         # Delta checkpoint-engine wire (standalone replicas): the generator yields
         # per-flush sparse payloads, applied in place through the verl custom
@@ -365,6 +397,152 @@ class ServerAdapter(BaseRollout):
             await self._engine.flush_cache()
             if global_steps is not None:
                 await self.server_actor.set_global_steps.remote(global_steps)
+
+    def _validate_preserved_weight_update(self, wire_format, peft_config) -> None:
+        """Reject unsupported modes before initializing or consuming the weight stream."""
+
+        def value(obj, key, default=None):
+            return obj.get(key, default) if isinstance(obj, Mapping) else getattr(obj, key, default)
+
+        quantization = value(self.config, "quantization")
+        engine_config = value(value(self.config, "engine_kwargs", {}), "sglang", {})
+        lora = value(self.model_config, "lora", {})
+        if wire_format != "named_tensors":
+            raise ValueError("preserve_kv_cache requires a complete named_tensors weight update")
+        if peft_config is not None or value(self.model_config, "lora_rank", 0) or value(lora, "rank", 0):
+            raise ValueError("preserve_kv_cache does not support LoRA weight updates")
+        if (
+            value(quantization, "enabled", False)
+            or any(value(quantization, field) for field in ("linear", "moe", "config_file"))
+            or value(value(self.model_config, "hf_config"), "quantization_config")
+            or value(engine_config, "quantization")
+        ):
+            raise ValueError("preserve_kv_cache does not support quantized weight updates")
+        if (
+            value(self.config, "data_parallel_size", 1) != 1
+            or value(self.config, "pipeline_model_parallel_size", 1) != 1
+            or value(value(self.config, "disaggregation"), "enabled", False)
+        ):
+            raise ValueError("preserve_kv_cache requires DP1/PP1 without PD disaggregation")
+        mtp = value(self.config, "mtp")
+        if value(engine_config, "speculative_algorithm") or (
+            value(mtp, "enable", False) and value(mtp, "enable_rollout", False)
+        ):
+            raise ValueError("preserve_kv_cache does not support speculative or MTP decoding")
+        if "delta" in str(value(value(self.config, "checkpoint_engine"), "backend", "")):
+            raise ValueError("preserve_kv_cache does not support delta weight updates")
+
+    async def _preserved_weight_update_request(self, endpoint, payload) -> None:
+        """Keep all TP participants on the same control path after a leader RPC."""
+        import torch.distributed as dist
+
+        mesh = self.device_mesh["infer_tp"]
+        leader = mesh.get_local_rank() == 0
+        outcome = [None]
+        error = None
+        if leader:
+            try:
+                if self._engine is None:
+                    raise RuntimeError("Missing TP leader server adapter")
+                result = await self._engine._make_async_request(endpoint, payload() if callable(payload) else payload)
+                if not isinstance(result, dict) or result.get("success") is not True:
+                    raise RuntimeError(f"SGLang {endpoint} rejected the preserved weight update")
+                outcome[0] = True
+            except (Exception, asyncio.CancelledError) as exc:
+                error = exc
+                outcome[0] = False
+        # Do not let nonleaders enter the next IPC gather when TP0 failed. The
+        # control wire carries no native response payload or private error path.
+        dist.broadcast_object_list(outcome, src=mesh.mesh.tolist()[0], group=mesh.get_group())
+        if outcome[0] is not True:
+            raise RuntimeError(f"SGLang {endpoint} failed during preserved weight update") from error
+
+    async def _update_weights_preserving_cache(self, weights, global_steps, uses_session=True) -> None:
+        """Load complete full weights while the caller keeps generation paused in place.
+
+        A native session is used only when both session schemas are available.
+        A failed load leaves the caller's pause intact; only a completed update
+        may publish the new step. This method never flushes, aborts, or resumes requests.
+        """
+        leader = self._is_server_tp_leader()
+        if uses_session:
+            await self._preserved_weight_update_request("begin_weight_update", {"selector": "all"})
+
+        bucket_bytes = int(self.config.checkpoint_engine.update_weights_bucket_megabytes) << 20
+        fusion_groups = (
+            DEEPSEEK_V4_FUSION_GROUPS
+            if getattr(self.model_config.hf_config, "model_type", None) == "deepseek_v4"
+            else ()
+        )
+        applied = 0
+        async for params_batch in get_named_tensor_buckets(weights, bucket_bytes, fusion_groups=fusion_groups):
+            await self._update_weights_preserved_bucket(params_batch)
+            applied += 1
+        if not applied:
+            raise ValueError("preserve_kv_cache requires a nonempty complete weight update")
+
+        # Native APIs with a session finalize weights without flushing KV.
+        if uses_session:
+            await self._preserved_weight_update_request("end_weight_update", {})
+        if leader:
+            if global_steps is not None:
+                await self.server_actor.set_global_steps.remote(global_steps)
+
+    async def _update_weights_preserved_bucket(self, params_batch) -> None:
+        """Use the existing TP gather/IPC wire with a non-flushing full-weight load."""
+        import base64
+
+        import torch.distributed as dist
+        from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
+        from sglang.srt.utils import MultiprocessingSerializer
+        from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+
+        try:
+            from sglang.srt.model_executor.model_runner import LocalSerializedTensor
+        except ImportError:
+            from sglang.srt.model_executor.model_runner_components.weight_updater import LocalSerializedTensor
+
+        monkey_patch_torch_reductions()
+        mesh = self.device_mesh["infer_tp"]
+        tp_size = mesh.mesh.size()[0]
+        serialized = [
+            (
+                _strip_lora_base_layer(name),
+                MultiprocessingSerializer.serialize(_to_ipc_device(_preprocess_tensor_for_update_weights(t.detach()))),
+            )
+            for name, t in params_batch
+        ]
+        gathered = [None for _ in range(tp_size)] if mesh.get_local_rank() == 0 else None
+        dist.gather_object(
+            obj=serialized,
+            object_gather_list=gathered,
+            dst=mesh.mesh.tolist()[0],
+            group=mesh.get_group(),
+        )
+
+        def payload():
+            named_tensors = [
+                (group[0][0], LocalSerializedTensor(values=[part[1] for part in group]))
+                for group in zip(*gathered, strict=True)
+            ]
+            req = UpdateWeightsFromTensorReqInput(
+                serialized_named_tensors=[MultiprocessingSerializer.serialize(named_tensors) for _ in range(tp_size)],
+                load_format=None,
+                flush_cache=False,
+                abort_all_requests=False,
+            )
+            return {
+                "serialized_named_tensors": [
+                    base64.b64encode(part).decode("utf-8") for part in req.serialized_named_tensors
+                ],
+                "load_format": req.load_format,
+                "flush_cache": req.flush_cache,
+                "abort_all_requests": req.abort_all_requests,
+            }
+
+        # The generic HTTP wrapper omits abort_all_requests; send the full native
+        # contract explicitly instead of allowing its bucket-level flush default.
+        await self._preserved_weight_update_request("update_weights_from_tensor", payload)
 
     async def _update_weights_delta(self, flushes, global_steps: int = None) -> None:
         """Apply the delta engine's sparse flushes in place.

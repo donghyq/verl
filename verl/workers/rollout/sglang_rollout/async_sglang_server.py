@@ -163,6 +163,8 @@ class SGLangHttpServer:
         self._disaggregation_bootstrap_port = disaggregation_bootstrap_port
 
         self.config: RolloutConfig = omega_conf_to_dataclass(config)
+        if self.config.preserve_kv_cache and self.config.prefix_cache_mode not in ("versioned", "shared"):
+            raise ValueError("prefix_cache_mode must be 'versioned' or 'shared'")
         self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config, dataclass_type=HFModelConfig)
         max_position_embeddings = get_max_position_embeddings(self.model_config.hf_config)
         if self.config.max_model_len is None:
@@ -335,6 +337,9 @@ class SGLangHttpServer:
             **engine_kwargs,
         }
         # bf16 weight updates crash SGLang's default MoE runner on Blackwell (see default_moe_runner_backend)
+        if self.config.preserve_kv_cache:
+            args["disable_radix_cache"] = not self.config.enable_prefix_caching
+
         moe_runner_backend = default_moe_runner_backend(quantization_config, engine_kwargs, self.model_config.hf_config)
         if moe_runner_backend is not None:
             args["moe_runner_backend"] = moe_runner_backend
@@ -529,6 +534,7 @@ class SGLangHttpServer:
         bootstrap_port: Optional[int] = None,
         bootstrap_room: Optional[int] = None,
         session_id: Optional[str] = None,
+        cache_salt: Optional[str] = None,
     ) -> TokenOutput:
         # PD top-level dispatch: prefill mints a bootstrap_room and fans out
         # paired local-prefill + remote-decode calls; decode returns the tokens
@@ -589,6 +595,7 @@ class SGLangHttpServer:
         )
         sampling_params["max_new_tokens"] = max_new_tokens
         return_logprob = sampling_params.pop("logprobs", False)
+        start_global_steps = self.global_steps
 
         # vLLM-style "prompt_logprobs=K" from the distillation teacher: request
         # input-token logprobs for every position (top-K when K>0, sampled-token
@@ -608,6 +615,15 @@ class SGLangHttpServer:
             # or a dict. Dropping it silently makes the model answer video questions blind.
             "video_data": video_data,
         }
+        if (
+            self.config.preserve_kv_cache
+            and self.config.enable_prefix_caching
+            and self.config.prefix_cache_mode == "versioned"
+        ):
+            if cache_salt is not None and not isinstance(cache_salt, str):
+                raise ValueError("cache_salt must be a string")
+            # SGLang normalizes an empty salt to None, which disables isolation.
+            request["cache_salt"] = cache_salt or str(start_global_steps)
 
         if prompt_logprobs is not None:
             request["logprob_start_len"] = 0
@@ -677,6 +693,14 @@ class SGLangHttpServer:
                 )
 
         extra_fields = {"global_steps": self.global_steps}
+        if self.config.preserve_kv_cache:
+            versions = [step for step in (start_global_steps, self.global_steps) if step is not None]
+            extra_fields.update(
+                min_global_steps=min(versions) if versions else None,
+                max_global_steps=max(versions) if versions else None,
+            )
+            if "cache_salt" in request:
+                extra_fields["cache_salt"] = request["cache_salt"]
         if prompt_logprobs is not None:
             _extract_prompt_logprobs_sglang(
                 meta_info=meta_info,
@@ -709,6 +733,11 @@ class SGLangHttpServer:
         if self.node_rank != 0:
             return
         await self.tokenizer_manager.pause_generation(PauseGenerationReqInput(mode="abort"))
+
+    async def pause_generation(self):
+        """Pause the native scheduler without retracting requests or releasing KV."""
+        if self.node_rank == 0:
+            await self.tokenizer_manager.pause_generation(PauseGenerationReqInput(mode="in_place"))
 
     async def resume_generation(self):
         if self.node_rank != 0:
@@ -856,6 +885,11 @@ class SGLangReplica(RolloutReplica):
             ]
         )
 
+        if self.config.preserve_kv_cache:
+            self.is_multimodal = await self.servers[0].__ray_call__.remote(
+                lambda server: server.tokenizer_manager.model_config.is_multimodal
+            )
+
         # get http server address from first server
         server_address, server_port = await self.servers[0].get_server_address.remote()
         self._server_handle = self.servers[0]
@@ -864,6 +898,26 @@ class SGLangReplica(RolloutReplica):
             if is_valid_ipv6_address(server_address)
             else f"{server_address}:{server_port}"
         )
+
+    @property
+    def supports_preserved_weight_updates(self):
+        """Restrict preservation to standalone, unquantized full-weight replicas."""
+        engine_kwargs = self.config.engine_kwargs.get("sglang", {}) or {}
+        return (
+            self.config.data_parallel_size == 1
+            and self.config.pipeline_model_parallel_size == 1
+            and not self.config.quantization.enabled
+            and not getattr(self.model_config.hf_config, "quantization_config", None)
+            and not engine_kwargs.get("quantization")
+            and not engine_kwargs.get("speculative_algorithm")
+            and not (self.config.mtp and self.config.mtp.enable and self.config.mtp.enable_rollout)
+            and not (self.model_config.lora_rank > 0 or self.model_config.lora.get("rank", 0) > 0)
+            and "delta" not in str(self.config.checkpoint_engine.backend)
+        )
+
+    async def pause_generation(self):
+        """Pause through the primary owner of the replica's native scheduler."""
+        await self.servers[0].pause_generation.remote()
 
     async def abort_all_requests(self, reject_request: bool = False):
         """Abort all ongoing generation requests on the primary server.

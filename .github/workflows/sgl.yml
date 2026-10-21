@@ -175,6 +175,11 @@ jobs:
       - name: Test SGLang ServerAdapter with Checkpoint Engine (NCCL)
         run: |
           ROLLOUT_NAME=sglang $UV_RUN pytest -svvv tests/checkpoint_engine/test_special_server_adapter.py
+      - name: Test SGLang preserved-request CPU contract
+        run: |
+          CUDA_VISIBLE_DEVICES="" $UV_RUN pytest -q \
+            tests/workers/rollout/rollout_sglang/test_preserve_requests_on_cpu.py \
+            tests/workers/rollout/rollout_sglang/test_preserve_kv_weights_on_cpu.py
 
   cleanup:
     runs-on: ubuntu-latest

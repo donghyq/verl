@@ -1,0 +1,153 @@
+{
+  "native_tag": "v0.5.20",
+  "native_commit": "94602c9c2b7cbdb8efd5c52802dac6a1c180089e",
+  "sglang_version": "0.5.20",
+  "session_mode": "direct",
+  "dependencies": {
+    "sglang": "0.5.20",
+    "sglang-kernel": "0.4.7",
+    "torch": "2.13.0+cu130",
+    "transformers": "5.12.1",
+    "ray": "2.55.1",
+    "cupy-cuda13x": "14.0.1",
+    "nvidia-nccl-cu13": "2.29.7",
+    "numpy": "2.4.6"
+  },
+  "adapter_sha256": "de753179f34fcfff6396e1576589cc52d1564f69ca6eb7eadd3242d8dfdad5f9",
+  "native_sources": [
+    {
+      "relative_path": "srt/managers/scheduler.py",
+      "file_sha256": "439ee96dd785fbb63a9f139b192cec984c252df16a573a436877f0ef9a4ca045",
+      "symbol_source_sha256": {
+        "Scheduler.pause_generation": "d10b83fab54b908d72a7067fdf553828fc0fa99c2b2e4d8316df549237d5b0af",
+        "Scheduler.run_batch": "2d7b9a35a54fc1d74ed047ac69defbe53ce2751deecccd63d76a53c902b25175",
+        "Scheduler.process_batch_result": "3e8b7ee88cd037e302d9219604b01a890cc1b146fea0dffdabdbe5f0166f956c",
+        "Scheduler.get_internal_state": "98625ccd0d5e8fdfd4f4efbe5fa118b243c6ea06e760957f7f20036eb3273a03"
+      },
+      "symbol_ast_sha256_python313": {
+        "Scheduler.pause_generation": "b3a92c1c170d37a3928d032f5503302bbe85e32466376fbcff37052ffd1a49a2",
+        "Scheduler.run_batch": "d2929e4bf650aab53ee8c54683f67d175f2b1f0dd2c8cd69b9b23035cc3913c7",
+        "Scheduler.process_batch_result": "a4e3ba0704162f6fee08fcde119a913170b6897975843927e06a999ec36e6167",
+        "Scheduler.get_internal_state": "a1be1ea747ddace2dc5ea2fb0a6e9c68bda9006e7ddd9e48b709e8852a09aad8"
+      }
+    },
+    {
+      "relative_path": "srt/managers/tokenizer_control_mixin.py",
+      "file_sha256": "7fe003bb2d98e6cb417a43c3f98a78bd5a3b88f0593cac15c23b56168e019be4",
+      "symbol_source_sha256": {
+        "TokenizerControlMixin.update_weights_from_tensor": "1bff000076f0ea6dc2f4a0403cecee2384f6fec1c529586c6045c912ed90d2f2",
+        "TokenizerControlMixin.get_internal_state": "c55d35334ef4afe3700deff4c3549a6fb9d232cf967783be9233463395bb6bc9"
+      },
+      "symbol_ast_sha256_python313": {
+        "TokenizerControlMixin.update_weights_from_tensor": "eac7575b1ded00e8e77837cbd7655e94fb8ebdb30ac4ac473f616b6a01c52212",
+        "TokenizerControlMixin.get_internal_state": "ea76a0ce16ac47f171cf80b87d577eb11b4cff40091064c399fa663cdceb4287"
+      }
+    },
+    {
+      "relative_path": "srt/managers/io_struct.py",
+      "file_sha256": "cc4e6a88ddfeaa78fc4518990013859168d5bc141905cd66252f9d020aa86cd5",
+      "symbol_source_sha256": {
+        "PauseGenerationReqInput": "d15ec16b699d245935ad121db979ea62143284eaed9201e2dec80a181c7cb6f1",
+        "UpdateWeightsFromTensorReqInput": "f925bd6f8e8109ee9a3745893c9bdfe3f3d268f5b4a2f08c1755023a330e14c7",
+        "GetInternalStateReq": "78aa4cfd47faa1ab0e39ab0b6d137bb8efd0d1fb1f25736c918f6c632c0ac131",
+        "GetInternalStateReqOutput": "8091d23249a8972034265cdd7ca1c3c1e673d5b2e494389520610ac8573c17ac"
+      },
+      "symbol_ast_sha256_python313": {
+        "PauseGenerationReqInput": "db9b5c6c12a4d21572c6416d0a8221611e6f0c1894000e7bfc19b00f7131d82f",
+        "UpdateWeightsFromTensorReqInput": "fa8e37e6ea1da2505f01211ab9eaa3cd295d93f14a603ba2cdbc883537a8e1d6",
+        "GetInternalStateReq": "de0f24408e117661747c93c61f75b481466c4527e57115d56f6f237b50134bd7",
+        "GetInternalStateReqOutput": "bf6ad028f39b979a7b17e5caa9126c58c037647d92b8e0463556037fcb0080ca"
+      }
+    },
+    {
+      "relative_path": "srt/managers/tp_worker.py",
+      "file_sha256": "3fd8496b1d7b122bfc30edf9f31b9529e96903fc0da26b7217beb29054044f12",
+      "symbol_source_sha256": {
+        "TpModelWorker.forward_batch_generation": "2f7a7c9cf2e9ba442ac6abe78f2fe2bd19fcd5b7aae09ce9646e839de042826a"
+      },
+      "symbol_ast_sha256_python313": {
+        "TpModelWorker.forward_batch_generation": "fd68e73170849f16f6fc8a8c5af6e9788015e6cda29b49bfe63ec7cdc67f502e"
+      }
+    },
+    {
+      "relative_path": "srt/model_executor/model_runner.py",
+      "file_sha256": "df38e26ace5deae708f2353b56962afab7f92fac35d1bd4f274b7d6d62356372",
+      "symbol_source_sha256": {
+        "ModelRunner.forward": "3e1f2fe81600c2f37698937eb58f3a3505f8054f339b4580f23036c5242b0077"
+      },
+      "symbol_ast_sha256_python313": {
+        "ModelRunner.forward": "462c1590e05bb08d5ab99224d37734bf418b9ef5c5e13408b66a376e9ec47a24"
+      }
+    },
+    {
+      "relative_path": "srt/entrypoints/engine.py",
+      "file_sha256": "7d79f61f6171902d60dcece76ce6ee16e11c4dae6e9e98e620941be92effc6b0",
+      "symbol_source_sha256": {
+        "Engine._launch_subprocesses": "a99d7c4659269bb8c8836b791d165d78636fa214bf7424df71825c0c981b5600",
+        "Engine.shutdown": "9950b3728ad78f555abee3ec2fcc1d1cbd10f9b43baea6744e29c6e52cfd61ec"
+      },
+      "symbol_ast_sha256_python313": {
+        "Engine._launch_subprocesses": "ce80637a9f88ff7ce1d3404062aeb9848dcbafbab381f0bdfde97468aef0549c",
+        "Engine.shutdown": "7aad9cba5773ea47afcc4871fe79a34e4d2fb6a3547190eccd0a2e1f536e1d75"
+      }
+    },
+    {
+      "relative_path": "srt/managers/scheduler_components/weight_updater.py",
+      "file_sha256": "753120e53a7ff15f5fad76585ae7451cf4cdcfc0d75b58ef33d4f55b38ed3793",
+      "symbol_source_sha256": {
+        "SchedulerWeightUpdaterManager.update_weights_from_tensor": "938c8c2c5dee77f5422b8a92db670351ba76898faa31054c12c49c02714ec7f7"
+      },
+      "symbol_ast_sha256_python313": {
+        "SchedulerWeightUpdaterManager.update_weights_from_tensor": "da20af495cbf41043e8991908112570a5a23ed579b420869ca1b6cba25f20c89"
+      }
+    },
+    {
+      "relative_path": "srt/state_capturer/base.py",
+      "file_sha256": "26c513d126e51ccf95a88797e9306b0e2c326cf500bffd441d915b3a3ea379a7",
+      "symbol_source_sha256": {
+        "BaseTopkCapturer.get_topk": "9eaf79f0292649f3cb2e14dcfcc2cbaccee619590cb9fe3750f418305d4a3940"
+      },
+      "symbol_ast_sha256_python313": {
+        "BaseTopkCapturer.get_topk": "a60bb445c63afbb109402621d636db9754aebacb2e2f21824dda4dc333dc1bad"
+      }
+    },
+    {
+      "relative_path": "srt/managers/schedule_batch.py",
+      "file_sha256": "06777e7b4c8a1d0b978a42c0370cf359a552fe7a23db411262f650db19755f7d",
+      "symbol_source_sha256": {
+        "FINISH_LENGTH": "eaf3c0f6635b5ac38c69822d03b06ae48c8535cc23f1ccf437320f9699cd55e3"
+      },
+      "symbol_ast_sha256_python313": {
+        "FINISH_LENGTH": "2882dac873bba909cef92ad04ccd54689ad864cd29e40dab726dc6023c43c893"
+      }
+    }
+  ],
+  "wheel": {
+    "url": "https://files.pythonhosted.org/packages/34/33/a253bf07c3973f2ad0f9fec4f30f8aadf9242705dfa3e9f36f0fe9dd0b60/sglang-0.5.20-cp312-cp312-manylinux_2_34_x86_64.whl",
+    "hash": "sha256:ffaced7e91c3536c63077b16b08210b5c1a2f362418e9841a8767d5e019cf08a",
+    "size": 27393093,
+    "upload-time": "2026-09-18T09:54:55.745Z"
+  },
+  "uv_lock_sha256": "cef45d9a8900b0309f2e95d65354e8f4b3b0ea815a38c6fefebfc5ccc02a30d3",
+  "verl_sources": [
+    {
+      "relative_path": "verl/workers/rollout/sglang_rollout/sglang_rollout.py",
+      "sha256": "de753179f34fcfff6396e1576589cc52d1564f69ca6eb7eadd3242d8dfdad5f9"
+    },
+    {
+      "relative_path": "verl/workers/rollout/sglang_rollout/async_sglang_server.py",
+      "sha256": "462c445e0d3e4d199da86f53be7f699438ac132dbfe9b86f143c7bf3dab324cb"
+    },
+    {
+      "relative_path": "verl/checkpoint_engine/base.py",
+      "sha256": "f904f7cde7723704c8ed813ef007402c2f4e3718e4720cbe3e4ca09d3df817a4"
+    },
+    {
+      "relative_path": "verl/workers/config/rollout.py",
+      "sha256": "d4deef899db13eb4c7611d7557fd275a58c2639cbb026c7b2940058d3a5d5172"
+    }
+  ],
+  "default_rollout_tp": 2,
+  "required_gpus": 3,
+  "scope": "One real SGD sender GPU + native SGLang TP2; TP1 is explicitly debug-only."
+}

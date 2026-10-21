@@ -523,7 +523,7 @@ class CheckpointEngineManager:
             return {}
 
         preserve_kv_cache = all(
-            r.config.name == "vllm"
+            (r.config.name == "vllm" or (r.config.name == "sglang" and r.supports_preserved_weight_updates))
             and r.config.preserve_kv_cache
             and r.rollout_mode == RolloutMode.STANDALONE
             and not r.config.disaggregation.enabled
