@@ -1,0 +1,2127 @@
+diff --git a/.github/workflows/sgl.yml b/.github/workflows/sgl.yml
+index c1e80aa14..e82950987 100644
+--- a/.github/workflows/sgl.yml
++++ b/.github/workflows/sgl.yml
+@@ -175,6 +175,11 @@ jobs:
+       - name: Test SGLang ServerAdapter with Checkpoint Engine (NCCL)
+         run: |
+           ROLLOUT_NAME=sglang $UV_RUN pytest -svvv tests/checkpoint_engine/test_special_server_adapter.py
++      - name: Test SGLang preserved-request CPU contract
++        run: |
++          CUDA_VISIBLE_DEVICES="" $UV_RUN pytest -q \
++            tests/workers/rollout/rollout_sglang/test_preserve_requests_on_cpu.py \
++            tests/workers/rollout/rollout_sglang/test_preserve_kv_weights_on_cpu.py
+ 
+   cleanup:
+     runs-on: ubuntu-latest
+diff --git a/docs/advance/v1_async_trainer.md b/docs/advance/v1_async_trainer.md
+index 712260772..cbb4dade2 100644
+--- a/docs/advance/v1_async_trainer.md
++++ b/docs/advance/v1_async_trainer.md
+@@ -67,6 +67,10 @@ actor_rollout_ref:
+ 
+ Custom multi-turn loops can pass `output.extra_fields["cache_salt"]` back as `cache_salt` on later `generate()` calls. Partial-rollout retries preserve it automatically.
+ 
++SGLang uses the same options with `rollout.name: sglang`. Its initial preservation path supports standalone text replicas with DP=1, PP=1, and complete unquantized weight updates. LoRA (including merged LoRA), delta updates, speculative decoding, multimodal models, and prefill/decode disaggregation retain the existing abort/retry path. TP may span multiple ranks; only the primary server controls the native scheduler.
++
++The SGLang engine pauses with native `in_place` scheduling and loads every weight bucket with `flush_cache=False` and `abort_all_requests=False`. Native SGLang 0.5.20 accepts paused tensor updates directly. Engines exposing both `begin_weight_update` and `end_weight_update` use a complete session instead; a partially available session API or missing preservation controls is rejected before consuming tensors. A failed update must not publish a new global step or resume the paused requests. The native API matrix, GPU behavior, and supported model families need qualification before enabling this option in production.
++
+ The KV allocation stays resident during synchronization, so leave space for weight-transfer buffers using `rollout.gpu_memory_utilization` and `rollout.checkpoint_engine.update_weights_bucket_megabytes`. Ordinary memory-pressure preemption can still recompute history. Requests are not migrated to another replica, and their in-memory state does not survive an engine restart.
+ 
+ Partial rollout is part of the V1 async client behavior rather than a V1 configuration switch. When a request is aborted:
+diff --git a/examples/sglang_preserve_contract.json b/examples/sglang_preserve_contract.json
+new file mode 100644
+index 000000000..e02665590
+--- /dev/null
++++ b/examples/sglang_preserve_contract.json
+@@ -0,0 +1,153 @@
++{
++  "native_tag": "v0.5.20",
++  "native_commit": "94602c9c2b7cbdb8efd5c52802dac6a1c180089e",
++  "sglang_version": "0.5.20",
++  "session_mode": "direct",
++  "dependencies": {
++    "sglang": "0.5.20",
++    "sglang-kernel": "0.4.7",
++    "torch": "2.13.0+cu130",
++    "transformers": "5.12.1",
++    "ray": "2.55.1",
++    "cupy-cuda13x": "14.0.1",
++    "nvidia-nccl-cu13": "2.29.7",
++    "numpy": "2.4.6"
++  },
++  "adapter_sha256": "de753179f34fcfff6396e1576589cc52d1564f69ca6eb7eadd3242d8dfdad5f9",
++  "native_sources": [
++    {
++      "relative_path": "srt/managers/scheduler.py",
++      "file_sha256": "439ee96dd785fbb63a9f139b192cec984c252df16a573a436877f0ef9a4ca045",
++      "symbol_source_sha256": {
++        "Scheduler.pause_generation": "d10b83fab54b908d72a7067fdf553828fc0fa99c2b2e4d8316df549237d5b0af",
++        "Scheduler.run_batch": "2d7b9a35a54fc1d74ed047ac69defbe53ce2751deecccd63d76a53c902b25175",
++        "Scheduler.process_batch_result": "3e8b7ee88cd037e302d9219604b01a890cc1b146fea0dffdabdbe5f0166f956c",
++        "Scheduler.get_internal_state": "98625ccd0d5e8fdfd4f4efbe5fa118b243c6ea06e760957f7f20036eb3273a03"
++      },
++      "symbol_ast_sha256_python313": {
++        "Scheduler.pause_generation": "b3a92c1c170d37a3928d032f5503302bbe85e32466376fbcff37052ffd1a49a2",
++        "Scheduler.run_batch": "d2929e4bf650aab53ee8c54683f67d175f2b1f0dd2c8cd69b9b23035cc3913c7",
++        "Scheduler.process_batch_result": "a4e3ba0704162f6fee08fcde119a913170b6897975843927e06a999ec36e6167",
++        "Scheduler.get_internal_state": "a1be1ea747ddace2dc5ea2fb0a6e9c68bda9006e7ddd9e48b709e8852a09aad8"
++      }
++    },
++    {
++      "relative_path": "srt/managers/tokenizer_control_mixin.py",
++      "file_sha256": "7fe003bb2d98e6cb417a43c3f98a78bd5a3b88f0593cac15c23b56168e019be4",
++      "symbol_source_sha256": {
++        "TokenizerControlMixin.update_weights_from_tensor": "1bff000076f0ea6dc2f4a0403cecee2384f6fec1c529586c6045c912ed90d2f2",
++        "TokenizerControlMixin.get_internal_state": "c55d35334ef4afe3700deff4c3549a6fb9d232cf967783be9233463395bb6bc9"
++      },
++      "symbol_ast_sha256_python313": {
++        "TokenizerControlMixin.update_weights_from_tensor": "eac7575b1ded00e8e77837cbd7655e94fb8ebdb30ac4ac473f616b6a01c52212",
++        "TokenizerControlMixin.get_internal_state": "ea76a0ce16ac47f171cf80b87d577eb11b4cff40091064c399fa663cdceb4287"
++      }
++    },
++    {
++      "relative_path": "srt/managers/io_struct.py",
++      "file_sha256": "cc4e6a88ddfeaa78fc4518990013859168d5bc141905cd66252f9d020aa86cd5",
++      "symbol_source_sha256": {
++        "PauseGenerationReqInput": "d15ec16b699d245935ad121db979ea62143284eaed9201e2dec80a181c7cb6f1",
++        "UpdateWeightsFromTensorReqInput": "f925bd6f8e8109ee9a3745893c9bdfe3f3d268f5b4a2f08c1755023a330e14c7",
++        "GetInternalStateReq": "78aa4cfd47faa1ab0e39ab0b6d137bb8efd0d1fb1f25736c918f6c632c0ac131",
++        "GetInternalStateReqOutput": "8091d23249a8972034265cdd7ca1c3c1e673d5b2e494389520610ac8573c17ac"
++      },
++      "symbol_ast_sha256_python313": {
++        "PauseGenerationReqInput": "db9b5c6c12a4d21572c6416d0a8221611e6f0c1894000e7bfc19b00f7131d82f",
++        "UpdateWeightsFromTensorReqInput": "fa8e37e6ea1da2505f01211ab9eaa3cd295d93f14a603ba2cdbc883537a8e1d6",
++        "GetInternalStateReq": "de0f24408e117661747c93c61f75b481466c4527e57115d56f6f237b50134bd7",
++        "GetInternalStateReqOutput": "bf6ad028f39b979a7b17e5caa9126c58c037647d92b8e0463556037fcb0080ca"
++      }
++    },
++    {
++      "relative_path": "srt/managers/tp_worker.py",
++      "file_sha256": "3fd8496b1d7b122bfc30edf9f31b9529e96903fc0da26b7217beb29054044f12",
++      "symbol_source_sha256": {
++        "TpModelWorker.forward_batch_generation": "2f7a7c9cf2e9ba442ac6abe78f2fe2bd19fcd5b7aae09ce9646e839de042826a"
++      },
++      "symbol_ast_sha256_python313": {
++        "TpModelWorker.forward_batch_generation": "fd68e73170849f16f6fc8a8c5af6e9788015e6cda29b49bfe63ec7cdc67f502e"
++      }
++    },
++    {
++      "relative_path": "srt/model_executor/model_runner.py",
++      "file_sha256": "df38e26ace5deae708f2353b56962afab7f92fac35d1bd4f274b7d6d62356372",
++      "symbol_source_sha256": {
++        "ModelRunner.forward": "3e1f2fe81600c2f37698937eb58f3a3505f8054f339b4580f23036c5242b0077"
++      },
++      "symbol_ast_sha256_python313": {
++        "ModelRunner.forward": "462c1590e05bb08d5ab99224d37734bf418b9ef5c5e13408b66a376e9ec47a24"
++      }
++    },
++    {
++      "relative_path": "srt/entrypoints/engine.py",
++      "file_sha256": "7d79f61f6171902d60dcece76ce6ee16e11c4dae6e9e98e620941be92effc6b0",
++      "symbol_source_sha256": {
++        "Engine._launch_subprocesses": "a99d7c4659269bb8c8836b791d165d78636fa214bf7424df71825c0c981b5600",
++        "Engine.shutdown": "9950b3728ad78f555abee3ec2fcc1d1cbd10f9b43baea6744e29c6e52cfd61ec"
++      },
++      "symbol_ast_sha256_python313": {
++        "Engine._launch_subprocesses": "ce80637a9f88ff7ce1d3404062aeb9848dcbafbab381f0bdfde97468aef0549c",
++        "Engine.shutdown": "7aad9cba5773ea47afcc4871fe79a34e4d2fb6a3547190eccd0a2e1f536e1d75"
++      }
++    },
++    {
++      "relative_path": "srt/managers/scheduler_components/weight_updater.py",
++      "file_sha256": "753120e53a7ff15f5fad76585ae7451cf4cdcfc0d75b58ef33d4f55b38ed3793",
++      "symbol_source_sha256": {
++        "SchedulerWeightUpdaterManager.update_weights_from_tensor": "938c8c2c5dee77f5422b8a92db670351ba76898faa31054c12c49c02714ec7f7"
++      },
++      "symbol_ast_sha256_python313": {
++        "SchedulerWeightUpdaterManager.update_weights_from_tensor": "da20af495cbf41043e8991908112570a5a23ed579b420869ca1b6cba25f20c89"
++      }
++    },
++    {
++      "relative_path": "srt/state_capturer/base.py",
++      "file_sha256": "26c513d126e51ccf95a88797e9306b0e2c326cf500bffd441d915b3a3ea379a7",
++      "symbol_source_sha256": {
++        "BaseTopkCapturer.get_topk": "9eaf79f0292649f3cb2e14dcfcc2cbaccee619590cb9fe3750f418305d4a3940"
++      },
++      "symbol_ast_sha256_python313": {
++        "BaseTopkCapturer.get_topk": "a60bb445c63afbb109402621d636db9754aebacb2e2f21824dda4dc333dc1bad"
++      }
++    },
++    {
++      "relative_path": "srt/managers/schedule_batch.py",
++      "file_sha256": "06777e7b4c8a1d0b978a42c0370cf359a552fe7a23db411262f650db19755f7d",
++      "symbol_source_sha256": {
++        "FINISH_LENGTH": "eaf3c0f6635b5ac38c69822d03b06ae48c8535cc23f1ccf437320f9699cd55e3"
++      },
++      "symbol_ast_sha256_python313": {
++        "FINISH_LENGTH": "2882dac873bba909cef92ad04ccd54689ad864cd29e40dab726dc6023c43c893"
++      }
++    }
++  ],
++  "wheel": {
++    "url": "https://files.pythonhosted.org/packages/34/33/a253bf07c3973f2ad0f9fec4f30f8aadf9242705dfa3e9f36f0fe9dd0b60/sglang-0.5.20-cp312-cp312-manylinux_2_34_x86_64.whl",
++    "hash": "sha256:ffaced7e91c3536c63077b16b08210b5c1a2f362418e9841a8767d5e019cf08a",
++    "size": 27393093,
++    "upload-time": "2026-09-18T09:54:55.745Z"
++  },
++  "uv_lock_sha256": "cef45d9a8900b0309f2e95d65354e8f4b3b0ea815a38c6fefebfc5ccc02a30d3",
++  "verl_sources": [
++    {
++      "relative_path": "verl/workers/rollout/sglang_rollout/sglang_rollout.py",
++      "sha256": "de753179f34fcfff6396e1576589cc52d1564f69ca6eb7eadd3242d8dfdad5f9"
++    },
++    {
++      "relative_path": "verl/workers/rollout/sglang_rollout/async_sglang_server.py",
++      "sha256": "462c445e0d3e4d199da86f53be7f699438ac132dbfe9b86f143c7bf3dab324cb"
++    },
++    {
++      "relative_path": "verl/checkpoint_engine/base.py",
++      "sha256": "f904f7cde7723704c8ed813ef007402c2f4e3718e4720cbe3e4ca09d3df817a4"
++    },
++    {
++      "relative_path": "verl/workers/config/rollout.py",
++      "sha256": "d4deef899db13eb4c7611d7557fd275a58c2639cbb026c7b2940058d3a5d5172"
++    }
++  ],
++  "default_rollout_tp": 2,
++  "required_gpus": 3,
++  "scope": "One real SGD sender GPU + native SGLang TP2; TP1 is explicitly debug-only."
++}
+diff --git a/examples/sglang_preserve_requests.py b/examples/sglang_preserve_requests.py
+new file mode 100644
+index 000000000..99a04f33c
+--- /dev/null
++++ b/examples/sglang_preserve_requests.py
+@@ -0,0 +1,117 @@
++# Copyright 2026 Individual Contributor: donghyq
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Opt-in native SGLang cross-weight probe; --help and source checks need only Python."""
++
++import argparse
++import ast
++import hashlib
++import importlib.metadata
++import importlib.util
++import json
++import os
++import platform
++import sys
++from pathlib import Path
++
++
++def sha(data):
++    return hashlib.sha256(data).hexdigest()
++
++
++def check_sources(native_root, contract):
++    evidence = []
++    for row in contract["native_sources"]:
++        path = native_root / row["relative_path"]
++        content = path.read_bytes()
++        if sha(content) != row["file_sha256"]:
++            raise ValueError(f"Native source differs: {row['relative_path']}")
++        text = content.decode()
++        tree = ast.parse(text)
++        for qualified, expected in row["symbol_source_sha256"].items():
++            current = tree
++            for name in qualified.split("."):
++                current = next(node for node in current.body if getattr(node, "name", None) == name)
++            if sha(ast.get_source_segment(text, current).encode()) != expected:
++                raise ValueError(f"Native method differs: {qualified}")
++        evidence.append({"path": row["relative_path"], "sha256": sha(content)})
++    return evidence
++
++
++def gate(repo_root, contract, native_root=None):
++    for row in contract["verl_sources"]:
++        if sha((repo_root / row["relative_path"]).read_bytes()) != row["sha256"]:
++            raise ValueError(f"VeRL source differs: {row['relative_path']}")
++    if sha((repo_root / "uv.lock").read_bytes()) != contract["uv_lock_sha256"]:
++        raise ValueError("uv.lock differs from the default SGLang dependency target")
++    if native_root is not None:
++        return {
++            "status": "PASS_SOURCE_PINS_ONLY",
++            "native_sources": check_sources(native_root, contract),
++            "dependency_import_CUDA_or_GPU": "NOT_RUN",
++        }
++    if platform.system() != "Linux" or sys.version_info[:2] != (3, 12):
++        raise RuntimeError("The GPU candidate requires Linux and Python 3.12")
++    versions = {name: importlib.metadata.version(name) for name in contract["dependencies"]}
++    if versions != contract["dependencies"]:
++        raise RuntimeError(f"Dependency versions differ: {versions}")
++    spec = importlib.util.find_spec("sglang")
++    if spec is None or not spec.submodule_search_locations:
++        raise RuntimeError("Installed SGLang package location is missing")
++    native_root = Path(next(iter(spec.submodule_search_locations)))
++    return {
++        "status": "PASS_INSTALLED_METADATA_AND_SOURCE_PINS",
++        "versions": versions,
++        "native_sources": check_sources(native_root, contract),
++        "CUDA_or_GPU": "NOT_RUN",
++    }
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[1])
++    parser.add_argument("--observer-dir", type=Path)
++    parser.add_argument("--contract", type=Path, default=Path(__file__).with_name("sglang_preserve_contract.json"))
++    parser.add_argument("--source-only", type=Path, metavar="NATIVE_SGLANG_ROOT")
++    parser.add_argument("--gate-only", action="store_true")
++    parser.add_argument(
++        "--run-gpu", action="store_true", help="Explicitly start this probe's own local Ray and tiny model"
++    )
++    parser.add_argument(
++        "--rollout-tp", choices=(1, 2), type=int, default=2, help="TP2 acceptance needs 3 GPUs; TP1 debug needs 2"
++    )
++    parser.add_argument("--output", type=Path, help="Fresh result directory; existing directories are rejected")
++    args = parser.parse_args()
++    if args.source_only is not None and args.run_gpu:
++        parser.error("--source-only cannot authorize a GPU run")
++    if not (args.gate_only or args.source_only is not None or args.run_gpu):
++        parser.error("Choose --gate-only, --source-only, or --run-gpu")
++    contract = json.loads(args.contract.read_text())
++    repo_root = args.repo_root.resolve()
++    evidence = gate(repo_root, contract, args.source_only)
++    if not args.run_gpu:
++        print(json.dumps(evidence))
++        return
++    if args.output is None:
++        parser.error("--run-gpu requires a fresh --output")
++    observer_dir = args.observer_dir or Path(__file__).resolve().parents[1] / "tests/special_distributed"
++    sys.path[:0] = [str(repo_root), str(observer_dir.resolve())]
++    os.chdir(repo_root)
++    from sglang_preserve_runtime import run_gpu
++
++    print(json.dumps(run_gpu(args.output.resolve(), tp=args.rollout_tp)))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/special_distributed/README_sglang_preserve.md b/tests/special_distributed/README_sglang_preserve.md
+new file mode 100644
+index 000000000..665dba9ff
+--- /dev/null
++++ b/tests/special_distributed/README_sglang_preserve.md
+@@ -0,0 +1,63 @@
++This is an opt-in GPU correctness candidate, not an executed GPU result.
++
++Apply the preserved-weight-update implementation and this new-file patch to
++the fixed VeRL review base. Use Linux x86_64, Python 3.12 and the repository's
++unchanged `uv.lock`. Its SGLang path selects SGLang 0.5.20, sglang-kernel 0.4.7,
++Torch 2.13.0+cu130, Transformers 5.12.1 and Ray 2.55.1. Do not substitute a
++different SGLang source checkout or the older CUDA 12.9 environment.
++
++```bash
++uv sync --frozen --extra fsdp --extra sglang --extra test
++uv run --no-sync python examples/sglang_preserve_requests.py --gate-only
++CUDA_VISIBLE_DEVICES='' uv run --no-sync python -c \
++  'import torch; from verl.workers.rollout.sglang_rollout.sglang_rollout import ServerAdapter; from verl.workers.rollout.sglang_rollout.async_sglang_server import SGLangReplica; from verl.checkpoint_engine import CheckpointEngineManager; assert not torch.cuda.is_initialized(); print("FULL_MODULE_IMPORT_PASS_NO_CUDA")'
++OMP_NUM_THREADS=1 timeout --signal=TERM --kill-after=30s 1200s \
++  uv run --no-sync python examples/sglang_preserve_requests.py \
++  --run-gpu --rollout-tp 2 --output /tmp/sglang-crossweight-fresh
++```
++
++The last command requires **three dedicated visible GPUs**: one real SGD/NCCL
++sender and two native SGLang TP workers. The result directory must not exist.
++TP1 (`--rollout-tp 1`) uses two GPUs and is a separate debugging scope.
++The repository's `docker/Dockerfile.uv.cu130` is a matching environment recipe;
++no prebuilt image or complete Linux cache has been verified by this preparation.
++
++The equivalent opt-in test is:
++
++```bash
++OMP_NUM_THREADS=1 VERL_RUN_SGLANG_PRESERVE_GPU=1 timeout 1200s \
++  uv run --no-sync pytest -q \
++  tests/special_distributed/test_sglang_preserve_requests.py
++```
++
++The probe reuses the existing tiny Qwen3 MoE and real SGD/NCCL sender. It calls
++the actual `CheckpointEngineManager` and `ServerAdapter`, pauses with native
++`in_place`, transfers complete parameters with native rank-specific CUDA IPC
++loading, and resumes the same unfinished RID. It checks both TP workers:
++
++- Native **loaded** router parameter digests match the sender before and after
++  the real SGD update, and change. Full sender parameter names/bytes and native
++  successful tensor-loader calls are recorded; this is not a byte comparison of
++  every fused native expert parameter against the HF parameter layout.
++- The request, committed KV bytes/storage, token/logprob prefix and MoE routing
++  stay intact while paused. Successful native forward processing records actual
++  input positions and output intervals. Newly launched forward inputs must have
++  zero overlap with the historical prefix; pending old overlap results are not
++  miscounted as newly executed forwards.
++- Every native tensor bucket reports success with `flush_cache=False`,
++  `abort_all_requests=False` and both TP entries. Radix and overlap remain enabled.
++- A new request uses the new version's cache salt and observes zero old-prefix
++  cache hits.
++
++`evidence.json` preserves raw per-rank observations. `result.json` reports PASS
++only after every assertion; errors preserve `first-error.txt` and owned cleanup
++evidence. Missing routing/forward evidence fails rather than fabricating a count.
++SG 0.5.20's tensor request does not supply a native weight-version span here;
++that field remains UNKNOWN. VeRL entry/exit steps and per-forward parameter
++digests are separate evidence. An already launched overlap forward may commit
++after resume using the old parameters; its actual interval remains labelled.
++
++This is a tiny-MoE smoke test for a mixed-weight in-flight request. It does not
++prove that its suffix equals a fresh request recomputed entirely with the new
++weights, nor cover GDN/Mamba, speculative decoding, DP/PP, LoRA, quantization,
++cross-host movement, business throughput or Trainer integration.
+diff --git a/tests/special_distributed/reused_tiny_moe.py b/tests/special_distributed/reused_tiny_moe.py
+new file mode 100644
+index 000000000..ea72a449c
+--- /dev/null
++++ b/tests/special_distributed/reused_tiny_moe.py
+@@ -0,0 +1,92 @@
++# Copyright 2026 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# Extracted from test_vllm_keep_requests.py; inference backend imports are excluded.
++
++"""Existing tiny MoE/SGD/NCCL fixture, with no inference-backend import."""
++
++import torch
++from tokenizers import Tokenizer
++from tokenizers.models import WordLevel
++from transformers import AutoModelForCausalLM, PreTrainedTokenizerFast, Qwen3MoeConfig
++
++from verl.checkpoint_engine import CheckpointEngineRegistry
++from verl.single_controller.base import Worker
++from verl.single_controller.base.decorator import Dispatch, register
++
++
++class WeightSender(Worker):
++    """Real checkpoint sender with a tiny model and optional next-token SGD updates."""
++
++    def __init__(self, model_path, checkpoint_config):
++        super().__init__()
++        self.model = AutoModelForCausalLM.from_pretrained(model_path, dtype=torch.bfloat16).cuda()
++        self.optimizer = torch.optim.SGD(self.model.parameters(), lr=0.05)
++        self.checkpoint_engine = CheckpointEngineRegistry.new(
++            "nccl",
++            bucket_size=checkpoint_config.update_weights_bucket_megabytes << 20,
++            is_master=True,
++            multi_sender=False,
++        )
++        self.change_weights = False
++        self.updates = []
++
++    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
++    def enable_updates(self):
++        self.change_weights = True
++
++    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
++    async def update_weights(self, global_steps=None, mode=None):
++        if self.change_weights:
++            self.optimizer.zero_grad()
++            tokens = torch.tensor([[1, 4, 5, 6, 7, 8]], device="cuda")
++            loss = self.model(tokens, labels=tokens).loss
++            loss.backward()
++            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
++            self.optimizer.step()
++            self.updates.append((float(loss.detach()), float(grad_norm)))
++        await self.checkpoint_engine.send_weights(self.model.named_parameters(), global_steps=global_steps)
++
++    @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
++    def execute_checkpoint_engine(self, method, *args, **kwargs):
++        return getattr(self.checkpoint_engine, method)(*args, **kwargs)
++
++    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
++    def update_results(self):
++        return self.updates
++
++
++def _save_tiny_moe(path):
++    torch.manual_seed(17)
++    config = Qwen3MoeConfig(
++        vocab_size=128,
++        hidden_size=128,
++        intermediate_size=256,
++        moe_intermediate_size=128,
++        num_hidden_layers=2,
++        num_attention_heads=4,
++        num_key_value_heads=2,
++        head_dim=32,
++        num_experts=8,
++        num_experts_per_tok=2,
++        max_position_embeddings=2048,
++        bos_token_id=1,
++        eos_token_id=2,
++        pad_token_id=0,
++    )
++    model = AutoModelForCausalLM.from_config(config).to(torch.bfloat16)
++    model.save_pretrained(path)
++    tokenizer = Tokenizer(WordLevel({f"t{i}": i for i in range(128)}, unk_token="t0"))
++    PreTrainedTokenizerFast(
++        tokenizer_object=tokenizer, unk_token="t0", pad_token="t0", bos_token="t1", eos_token="t2"
++    ).save_pretrained(path)
+diff --git a/tests/special_distributed/sglang_preserve_runtime.py b/tests/special_distributed/sglang_preserve_runtime.py
+new file mode 100644
+index 000000000..343d2627c
+--- /dev/null
++++ b/tests/special_distributed/sglang_preserve_runtime.py
+@@ -0,0 +1,532 @@
++# Copyright 2026 Individual Contributor: donghyq
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Opt-in tiny SGLang GPU probe. All observations wrap native methods; no simulated counters."""
++
++import asyncio
++import hashlib
++import json
++import os
++import sys
++import types
++from pathlib import Path
++
++import numpy as np
++import ray
++import torch
++from reused_tiny_moe import WeightSender, _save_tiny_moe
++from sglang.srt.entrypoints.engine import Engine
++
++from verl.checkpoint_engine import CheckpointEngineManager
++from verl.single_controller.base.decorator import Dispatch, register
++from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
++from verl.single_controller.ray.base import split_resource_pool
++from verl.workers.config import CheckpointEngineConfig, HFModelConfig, RolloutConfig
++from verl.workers.rollout.sglang_rollout.async_sglang_server import SGLangHttpServer, SGLangReplica
++
++# These real router parameters are replicated under the native tiny-MoE TP
++# layout. Comparing them does not pretend that HF and fused/sharded native
++# expert parameter names or storage layouts are interchangeable.
++SELECTED = tuple(f"model.layers.{layer}.mlp.gate.weight" for layer in range(2))
++
++
++def digest(tensor):
++    tensor = tensor.detach().contiguous()
++    return hashlib.sha256(tensor.view(torch.uint8).cpu().numpy().tobytes()).hexdigest()
++
++
++def parameter_digests(model):
++    values = {name: digest(value) for name, value in model.named_parameters() if name in SELECTED}
++    if set(values) != set(SELECTED):
++        raise RuntimeError("Tiny MoE parameter identity does not match this probe")
++    return values
++
++
++def tree_digest(value):
++    if torch.is_tensor(value):
++        return {"shape": list(value.shape), "dtype": str(value.dtype), "sha256": digest(value)}
++    if isinstance(value, dict):
++        return {key: tree_digest(part) for key, part in value.items()}
++    if isinstance(value, list | tuple):
++        return [tree_digest(part) for part in value]
++    raise TypeError("Unknown native KV-copy payload; no counter or digest is inferred")
++
++
++class RecordedSender(WeightSender):
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        self.send_records = []
++        send = self.checkpoint_engine.send_weights
++
++        async def observed_send(weights, **send_kwargs):
++            expected = [name for name, _ in self.model.named_parameters()]
++            visited, sizes = [], []
++
++            def stream():
++                for name, tensor in weights:
++                    visited.append(name)
++                    sizes.append(tensor.numel() * tensor.element_size())
++                    yield name, tensor
++
++            result = await send(stream(), **send_kwargs)  # Original NCCL sender, not a replacement transport.
++            assert visited == expected, "Complete trainer parameter stream was not consumed"
++            self.send_records.append(
++                {"global_steps": send_kwargs.get("global_steps"), "names": visited, "bytes": sum(sizes)}
++            )
++            return result
++
++        self.checkpoint_engine.send_weights = observed_send
++
++    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
++    def weight_evidence(self):
++        return {"selected": parameter_digests(self.model), "sends": list(self.send_records), "SGD": self.updates}
++
++
++def observed_scheduler_process(*args, **kwargs):
++    """Run the original scheduler with read-only test observations in its own child process."""
++    import sglang.srt.managers.scheduler as native
++    from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
++
++    original_scheduler = native.Scheduler
++
++    class ObservedScheduler(original_scheduler):
++        def __init__(self, *a, **kw):
++            super().__init__(*a, **kw)
++            self.probe_completed, self.probe_results, self.probe_finished = [], {}, {}
++            self.probe_forward_id = 0
++            self.probe_tensor_updates = []
++            self.probe_context = None
++            runner = self.tp_worker.model_runner
++            forward = runner.forward
++            update = self.tp_worker.update_weights_from_tensor
++
++            def observe_update(_worker, request):
++                result = update(request)  # Native rank-specific IPC deserialization and loader.
++                self.probe_tensor_updates.append(
++                    {
++                        "success": result[0] is True,
++                        "flush_cache": request.flush_cache,
++                        "abort_all_requests": request.abort_all_requests,
++                        "serialized_tp_entries": len(request.serialized_named_tensors),
++                    }
++                )
++                return result
++
++            self.tp_worker.update_weights_from_tensor = types.MethodType(observe_update, self.tp_worker)
++
++            def observe_forward(_runner, forward_batch, *a, **kw):
++                if self.probe_context is not None:
++                    rows = forward_batch.req_pool_indices.detach().cpu().tolist()
++                    positions = forward_batch.positions.detach().cpu().tolist()
++                    lengths = (
++                        [1] * len(rows)
++                        if forward_batch.forward_mode.is_decode()
++                        else list(forward_batch.extend_seq_lens_cpu)
++                    )
++                    if len(rows) != len(lengths) or len(positions) != sum(lengths):
++                        raise RuntimeError("Unrecognized actual ForwardBatch position layout")
++                    cursor = 0
++                    weights = parameter_digests(_runner.model)
++                    for row, length in zip(rows, lengths, strict=True):
++                        rid = self.probe_context["rows"][int(row)]
++                        self.probe_context["inputs"].append(
++                            {
++                                "rid": rid,
++                                "forward_id": self.probe_context["forward_id"],
++                                "positions": positions[cursor : cursor + length],
++                                "weights": weights,
++                            }
++                        )
++                        cursor += length
++                return forward(forward_batch, *a, **kw)
++
++            runner.forward = types.MethodType(observe_forward, runner)
++
++        def run_batch(self, batch, *a, **kw):
++            self.probe_forward_id += 1
++            context = {
++                "forward_id": self.probe_forward_id,
++                "rows": {int(req.kv.req_pool_idx): req.rid for req in batch.reqs},
++                "inputs": [],
++            }
++            self.probe_context = context
++            try:
++                result = super().run_batch(batch, *a, **kw)
++            finally:
++                self.probe_context = None
++            if id(result) in self.probe_results:
++                raise RuntimeError("Native result reused before successful processing")
++            self.probe_results[id(result)] = context["inputs"]
++            return result
++
++        def process_batch_result(self, batch, result):
++            requests = list(batch.reqs)
++            starts = {req.rid: len(req.output_ids) for req in requests}
++            super().process_batch_result(batch, result)
++            # Original output processing synchronizes copy_done; this explicit
++            # test synchronization additionally rejects asynchronous CUDA errors.
++            torch.cuda.synchronize()
++            records = self.probe_results.pop(id(result))
++            for row in records:
++                req = next(req for req in requests if req.rid == row["rid"])
++                row["output_interval"] = [starts[req.rid], len(req.output_ids)]
++            self.probe_completed.extend(records)
++            for req in requests:
++                if req.finished():
++                    self.probe_finished[req.rid] = self.request_state(req, copy_kv=False)
++
++        def request_state(self, req, copy_kv):
++            state = {
++                "rid": req.rid,
++                "token_ids": list(req.output_ids),
++                "log_probs": list(req.logprob.output_token_logprobs_val or []),
++                "cache_salt": req.cache_salt,
++                "cached_tokens": int(req.cached_tokens),
++                "finished": req.finished(),
++                "request_row": req.kv.req_pool_idx,
++                "kv_committed_len": int(req.kv.kv_committed_len),
++                "routing": None,
++            }
++            routing = req.routed_experts
++            if not req.finished():
++                capturer = get_global_experts_capturer()
++                if capturer is not None and req.return_routed_experts:
++                    routing = capturer.get_topk(
++                        req_pool_idx=req.kv.req_pool_idx,
++                        seqlen=len(req.origin_input_ids) + len(req.output_ids_through_stop),
++                        req_to_token_pool=self.req_to_token_pool,
++                        start_len=req.routed_experts_start_len,
++                    )
++            if routing is not None:
++                state["routing"] = routing.reshape(-1, 2, 2).cpu().tolist()
++            if copy_kv and not req.finished():
++                row, length = int(req.kv.req_pool_idx), int(req.kv.kv_committed_len)
++                indices = self.req_to_token_pool.req_to_token[row, :length].clone()
++                pool = self.token_to_kv_pool_allocator.get_kvcache()
++                if not hasattr(pool, "k_buffer") or not hasattr(pool, "v_buffer"):
++                    raise RuntimeError("This tiny-attention probe does not recognize the native pool")
++                state["token_slots"] = indices.cpu().tolist()
++                state["KV"] = tree_digest(pool.get_cpu_copy(indices))
++                state["KV_storage"] = [tensor.data_ptr() for tensor in [*pool.k_buffer, *pool.v_buffer]]
++            return state
++
++        def get_internal_state(self, request):
++            response = super().get_internal_state(request)
++            unique = {}
++            batches = [self.running_batch, self.last_batch]
++            for batch in batches:
++                if batch is not None:
++                    unique.update({req.rid: req for req in batch.reqs if not req.finished()})
++            if self.chunked_req is not None and not self.chunked_req.finished():
++                unique[self.chunked_req.rid] = self.chunked_req
++            observation = {
++                "tp_rank": self.tp_group.rank_in_group,
++                "tp_size": self.tp_group.world_size,
++                "overlap_enabled": bool(self.enable_overlap),
++                "radix_cache_disabled": response.internal_state.get("disable_radix_cache"),
++                "last_launched_forward_id": self.probe_forward_id,
++                "paused": bool(self._engine_paused),
++                "requests": {rid: self.request_state(req, copy_kv=self._engine_paused) for rid, req in unique.items()},
++                "completed": list(self.probe_completed),
++                "pending": [row for rows in self.probe_results.values() for row in rows],
++                "finished": dict(self.probe_finished),
++                "weights": parameter_digests(self.tp_worker.model_runner.model),
++                "tensor_updates": list(self.probe_tensor_updates),
++            }
++            # This native control request is broadcast to the TP workers. Gather
++            # observations on its existing CPU group; TP0's real response carries
++            # the original per-rank evidence instead of fabricating other ranks.
++            observations = [None] * self.tp_group.world_size
++            torch.distributed.all_gather_object(observations, observation, group=self.tp_cpu_group)
++            response.internal_state["preserve_probe"] = observations
++            return response
++
++    native.Scheduler = ObservedScheduler
++    native.run_scheduler_process(*args, **kwargs)
++
++
++class ObservedServer(SGLangHttpServer):
++    async def launch_server(self, *args, **kwargs):
++        descriptor = Engine.__dict__["_launch_subprocesses"]
++        launch = Engine._launch_subprocesses
++
++        def observe_launch(**launch_kwargs):
++            launch_kwargs["run_scheduler_process_func"] = observed_scheduler_process
++            output = launch(**launch_kwargs)
++            if len(output) != 6:
++                raise RuntimeError("Native launch return contract changed")
++            output[0]._subprocess_watchdog = output[4]
++            self._weight_cache_daemon_procs = output[5]
++            return output
++
++        Engine._launch_subprocesses = staticmethod(observe_launch)
++        try:
++            await super().launch_server(*args, **kwargs)
++        finally:
++            Engine._launch_subprocesses = descriptor
++
++    async def observed_native(self):
++        states = await self.tokenizer_manager.get_internal_state()
++        if len(states) != 1:
++            raise RuntimeError("This probe requires native DP1")
++        return states[0]["preserve_probe"]
++
++    async def cleanup_owned_engine(self):
++        import psutil
++
++        Engine.shutdown(self)  # Native cleanup affects only this owned Ray actor's children.
++        remaining = [child.pid for child in psutil.Process().children(recursive=True) if child.is_running()]
++        if remaining:
++            raise RuntimeError(f"Owned engine children remain: {remaining}")
++        return {"owned_children_remaining": remaining}
++
++
++class ObservedReplica(SGLangReplica):
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        self.server_class = ray.remote(ObservedServer)
++        self.observe, self.boundaries = False, []
++
++    async def pause_generation(self):
++        await super().pause_generation()
++        if self.observe:
++            self.before = await self.servers[0].observed_native.remote()
++
++    async def resume_generation(self):
++        if self.observe:
++            self.boundaries.append((self.before, await self.servers[0].observed_native.remote()))
++        await super().resume_generation()
++
++
++async def exercise(model_path, out, tp):
++    checkpoint = CheckpointEngineConfig(backend="nccl", update_weights_bucket_megabytes=1)
++    config = RolloutConfig(
++        name="sglang",
++        mode="async",
++        tensor_model_parallel_size=tp,
++        prompt_length=64,
++        response_length=512,
++        max_model_len=1024,
++        max_num_seqs=4,
++        max_num_batched_tokens=1024,
++        enforce_eager=True,
++        preserve_kv_cache=True,
++        enable_prefix_caching=True,
++        prefix_cache_mode="versioned",
++        enable_rollout_routing_replay=True,
++        calculate_log_probs=True,
++        free_cache_engine=False,
++        gpu_memory_utilization=0.2,
++        checkpoint_engine=checkpoint,
++        engine_kwargs={
++            "sglang": {"attention_backend": "triton", "moe_runner_backend": "triton", "max_total_tokens": 2048}
++        },
++    )
++    pool = RayResourcePool(process_on_nodes=[1 + tp], max_colocate_count=2)
++    sender_pool, rollout_pool = split_resource_pool(pool, [1, tp])
++    sender = RayWorkerGroup(
++        resource_pool=sender_pool,
++        ray_cls_with_init=RayClassWithInitArgs(
++            cls=ray.remote(RecordedSender), model_path=model_path, checkpoint_config=checkpoint
++        ),
++    )
++    replica = ObservedReplica(0, config, HFModelConfig(path=model_path), gpus_per_node=1 + tp)
++    cleanup = None
++    try:
++        await replica.init_standalone(rollout_pool)
++        manager = CheckpointEngineManager(checkpoint, sender, [replica])
++        await manager.update_weights(global_steps=0)
++        before_sender = sender.weight_evidence()[0]
++        prompt = [1, 4, 5, 6] * 16
++        sampling = {"temperature": 0.0, "max_tokens": 512, "ignore_eos": True, "logprobs": True}
++        rid = "crossweight-live"
++        pending = replica.servers[0].generate.remote(prompt, dict(sampling), rid)
++        async with asyncio.timeout(90):
++            while True:
++                states = await replica.servers[0].observed_native.remote()
++                if sorted(state["tp_rank"] for state in states) != list(range(tp)):
++                    raise RuntimeError("Actual native TP observations are incomplete")
++                active = states[0]["requests"].get(rid)
++                if active and 8 <= len(active["token_ids"]) < 480:
++                    break
++                if rid in states[0]["finished"]:
++                    raise RuntimeError("Request completed before the weight-update window; no retry")
++                await asyncio.sleep(0.01)
++        sender.enable_updates()
++        replica.observe = True
++        await manager.update_weights(global_steps=1)
++        output = await asyncio.wait_for(pending, timeout=120)
++        replica.observe = False
++        final_native = await replica.servers[0].observed_native.remote()
++        after_sender = sender.weight_evidence()[0]
++        fresh = await replica.servers[0].generate.remote(prompt, {**sampling, "max_tokens": 1}, "fresh-version-one")
++        next_native = await replica.servers[0].observed_native.remote()
++        if len(replica.boundaries) != 1:
++            raise RuntimeError("Exactly one observed real update is required")
++        before, after = replica.boundaries[0]
++        rank_receipts = [
++            validate(b, a, f, before_sender, after_sender, output, fresh, n, rid)
++            for b, a, f, n in zip(before, after, final_native, next_native, strict=True)
++        ]
++        receipt = {
++            "status": "PASS_TINY_MOE_CROSSWEIGHT_PRESERVATION",
++            "rollout_tp": tp,
++            "required_gpus": 1 + tp,
++            "ranks": rank_receipts,
++        }
++        (out / "evidence.json").write_text(
++            json.dumps(
++                {
++                    "receipt": receipt,
++                    "before": before,
++                    "after": after,
++                    "final": final_native,
++                    "sender_before": before_sender,
++                    "sender_after": after_sender,
++                },
++                indent=2,
++            )
++            + "\n"
++        )
++        return receipt
++    finally:
++        original_failure = sys.exc_info()[0] is not None
++        try:
++            if replica.servers:
++                cleanup = await replica.servers[0].cleanup_owned_engine.remote()
++        except BaseException as exc:
++            cleanup = {"status": "FAILED", "cause": type(exc).__name__}
++            if not original_failure:
++                raise
++        finally:
++            (out / "cleanup.json").write_text(json.dumps({"owned_engine": cleanup}) + "\n")
++
++
++def validate(before, after, final, sender_before, sender_after, output, fresh, next_native, rid):
++    assert before["tp_rank"] == after["tp_rank"] == final["tp_rank"] == next_native["tp_rank"]
++    assert before["paused"] and after["paused"]
++    assert before["overlap_enabled"] and after["overlap_enabled"]
++    assert before["radix_cache_disabled"] is False and after["radix_cache_disabled"] is False
++    assert rid in before["requests"] and rid in after["requests"]
++    state = before["requests"][rid]
++    assert state["kv_committed_len"] > 0 and len(state["token_slots"]) == state["kv_committed_len"]
++    assert state == after["requests"][rid], "Request/KV/routing changed during the update"
++    assert before["completed"] == after["completed"], "Forward completed during paused update"
++    assert before["pending"] == after["pending"], "Native result ownership changed during paused update"
++    assert before["weights"] == sender_before["selected"]
++    assert after["weights"] == sender_after["selected"] and before["weights"] != after["weights"]
++    assert len(after["tensor_updates"]) > len(before["tensor_updates"]) > 0
++    assert all(
++        row["success"]
++        and row["flush_cache"] is False
++        and row["abort_all_requests"] is False
++        and row["serialized_tp_entries"] == before["tp_size"]
++        for row in after["tensor_updates"]
++    )
++    assert len(sender_after["SGD"]) == 1
++    loss, grad = sender_after["SGD"][0]
++    assert np.isfinite(loss) and np.isfinite(grad) and grad > 0
++    assert len(sender_after["sends"]) == 2 and all(send["bytes"] > 0 for send in sender_after["sends"])
++    count = len(state["token_ids"])
++    assert not state["finished"] and 0 < count < len(output.token_ids) == 512
++    assert output.stop_reason == "length" and len(output.log_probs) == 512
++    assert output.token_ids[:count] == state["token_ids"]
++    assert output.log_probs[:count] == state["log_probs"]
++    if state["routing"] is None or output.routed_experts is None:
++        raise RuntimeError("UNKNOWN: native MoE routing capture is missing")
++    np.testing.assert_array_equal(output.routed_experts[: len(state["routing"])], state["routing"])
++    assert output.extra_fields["min_global_steps"] == 0 and output.extra_fields["max_global_steps"] == 1
++    assert output.extra_fields["cache_salt"] == "0" and fresh.extra_fields["cache_salt"] == "1"
++    assert next_native["finished"]["fresh-version-one"]["cached_tokens"] == 0
++    assert next_native["finished"]["fresh-version-one"]["cache_salt"] == "1"
++    # In overlap mode an old forward can finish before pause but remain queued
++    # for native result processing. Its later commit is not a recomputation.
++    old = [pos for row in before["completed"] + before["pending"] if row["rid"] == rid for pos in row["positions"]]
++    completed = [row for row in final["completed"] if row["rid"] == rid]
++    positions = [pos for row in completed for pos in row["positions"]]
++    if not old or not positions:
++        raise RuntimeError("UNKNOWN: actual completed forward input positions missing")
++    assert positions == list(range(64 + 512 - 1)), "History repeated, dropped, or unexpected prefix reuse"
++    new = [row for row in completed if row["forward_id"] > before["last_launched_forward_id"]]
++    history_overlap = sum(pos in set(old) for row in new for pos in row["positions"])
++    assert history_overlap == 0
++    assert any(row["weights"] == after["weights"] for row in new), "No completed forward using updated parameters"
++    output_intervals = [row["output_interval"] for row in completed]
++    assert output_intervals == [[index, index + 1] for index in range(512)]
++    assert all(row["weights"] in (before["weights"], after["weights"]) for row in completed)
++    updated_outputs = sum(
++        row["output_interval"][1] - row["output_interval"][0] for row in completed if row["weights"] == after["weights"]
++    )
++    assert updated_outputs > 0
++    return {
++        "status": "PASS_TINY_MOE_CROSSWEIGHT_PRESERVATION",
++        "RID": rid,
++        "tp_rank": before["tp_rank"],
++        "optimizer_steps": 1,
++        "preserved_output_tokens": count,
++        "output_tokens_after_preserved_prefix": 512 - count,
++        "outputs_using_updated_router_parameters": updated_outputs,
++        "completed_forward_inputs": len(positions),
++        "historical_inputs_recomputed": history_overlap,
++        "completed_native_tensor_buckets": len(after["tensor_updates"]) - len(before["tensor_updates"]),
++        "routing_prefix_verified": True,
++        "fresh_version_salt": "1",
++        "native_weight_version_spans": "UNKNOWN_NOT_ASSERTED",
++        "scope": (
++            "One tiny MoE, native TP workers+one trainer GPU, in-place synchronization; "
++            "no throughput or cross-host claim"
++        ),
++    }
++
++
++def run_gpu(out, tp=2):
++    if tp not in (1, 2):
++        raise ValueError("Only TP1 debug and TP2 acceptance are defined")
++    if ray.is_initialized():
++        raise RuntimeError("Use a fresh process; this probe must not share an existing Ray session")
++    out = Path(out)
++    out.mkdir(parents=True, exist_ok=False)
++    owned_ray = False
++    try:
++        if torch.cuda.device_count() != 1 + tp:
++            raise RuntimeError(f"Requires exactly {1 + tp} dedicated visible GPUs: sender1 + native rollout TP{tp}")
++        torch.cuda.init()
++        devices = []
++        for index in range(1 + tp):
++            properties = torch.cuda.get_device_properties(index)
++            if properties.major < 8:
++                raise RuntimeError("This BF16 tiny-MoE candidate requires SM80 or newer")
++            devices.append({"index": index, "name": properties.name, "uuid": str(properties.uuid)})
++        (out / "cuda-preflight.json").write_text(
++            json.dumps({"torch": torch.__version__, "cuda": torch.version.cuda, "devices": devices}) + "\n"
++        )
++        model = out / "tiny_moe"
++        _save_tiny_moe(model)
++        pythonpath = os.pathsep.join((os.getcwd(), str(Path(__file__).resolve().parent)))
++        ray.init(address="local", num_gpus=1 + tp, num_cpus=12, runtime_env={"env_vars": {"PYTHONPATH": pythonpath}})
++        owned_ray = True
++        receipt = asyncio.run(exercise(str(model), out, tp))
++        (out / "result.json").write_text(json.dumps(receipt, indent=2) + "\n")
++        return receipt
++    except BaseException as exc:
++        import traceback
++
++        (out / "first-error.txt").write_text(traceback.format_exc())
++        (out / "result.json").write_text(
++            json.dumps({"status": "FAILED_OR_INCOMPLETE", "cause": type(exc).__name__}) + "\n"
++        )
++        raise
++    finally:
++        if owned_ray:
++            ray.shutdown()  # Only the local Ray instance started by this probe.
+diff --git a/tests/special_distributed/test_sglang_preserve_requests.py b/tests/special_distributed/test_sglang_preserve_requests.py
+new file mode 100644
+index 000000000..553431a08
+--- /dev/null
++++ b/tests/special_distributed/test_sglang_preserve_requests.py
+@@ -0,0 +1,38 @@
++# Copyright 2026 Individual Contributor: donghyq
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Opt-in real three-GPU test; no generated counter is substituted for native execution."""
++
++import importlib.util
++import json
++import os
++from pathlib import Path
++
++import pytest
++
++
++def test_sglang_native_crossweight_requests(tmp_path):
++    if os.environ.get("VERL_RUN_SGLANG_PRESERVE_GPU") != "1":
++        pytest.skip("Opt-in: requires Linux default SGLang lock and three dedicated GPUs")
++    root = Path(__file__).resolve().parents[2]
++    spec = importlib.util.spec_from_file_location("preserve_gate", root / "examples/sglang_preserve_requests.py")
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    contract = json.loads((root / "examples/sglang_preserve_contract.json").read_text())
++    module.gate(root, contract)
++    from sglang_preserve_runtime import run_gpu
++
++    result = run_gpu(tmp_path / "crossweight", tp=2)
++    assert result["status"] == "PASS_TINY_MOE_CROSSWEIGHT_PRESERVATION"
++    assert result["rollout_tp"] == 2 and len(result["ranks"]) == 2
+diff --git a/tests/special_sanity/check_license.py b/tests/special_sanity/check_license.py
+index 425923afe..0924fd5d5 100644
+--- a/tests/special_sanity/check_license.py
++++ b/tests/special_sanity/check_license.py
+@@ -22,6 +22,7 @@ license_head_bytedance_26 = "Copyright 2026 Bytedance Ltd. and/or its affiliates
+ # Add custom license headers below
+ license_head_prime = "Copyright 2024 PRIME team and/or its affiliates"
+ license_head_individual = "Copyright 2025 Individual Contributor:"
++license_head_individual_26 = "Copyright 2026 Individual Contributor:"
+ license_head_sglang = "Copyright 2023-2024 SGLang Team"
+ license_head_modelbest = "Copyright 2025 ModelBest Inc. and/or its affiliates"
+ license_head_amazon = "Copyright 2025 Amazon.com Inc and/or its affiliates"
+@@ -40,6 +41,7 @@ license_headers = [
+     license_head_bytedance_26,
+     license_head_prime,
+     license_head_individual,
++    license_head_individual_26,
+     license_head_sglang,
+     license_head_modelbest,
+     license_head_amazon,
+diff --git a/tests/workers/rollout/rollout_sglang/test_preserve_kv_weights_on_cpu.py b/tests/workers/rollout/rollout_sglang/test_preserve_kv_weights_on_cpu.py
+new file mode 100644
+index 000000000..868751a7d
+--- /dev/null
++++ b/tests/workers/rollout/rollout_sglang/test_preserve_kv_weights_on_cpu.py
+@@ -0,0 +1,398 @@
++# Copyright 2026 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Real adapter methods with CPU transport/collective collaborators, not a GPU test.
++
++This public entry imports the actual adapter and native request/serializer modules.
++IPC/GPU transfer and TP collectives are replaced only at their external boundaries.
++"""
++
++import asyncio
++import base64
++import copy
++import importlib.util
++import pickle
++import threading
++import unittest
++from concurrent.futures import ThreadPoolExecutor
++from types import SimpleNamespace
++from typing import Literal
++from unittest.mock import AsyncMock, patch
++
++if importlib.util.find_spec("sglang") is None:
++    raise unittest.SkipTest("Requires SGLang; no adapter-module import or GPU verification performed")
++
++import torch.distributed as dist
++from sglang.srt import managers
++from sglang.srt.utils import MultiprocessingSerializer, patch_torch
++
++from verl.workers.rollout.sglang_rollout import sglang_rollout as rollout
++
++
++class TensorValue:
++    def __init__(self, value):
++        self.value = value
++
++    def detach(self):
++        return self
++
++
++class Mesh:
++    def __init__(self, rank=0):
++        self.rank = rank
++        self.mesh = SimpleNamespace(size=lambda: (2,), tolist=lambda: [4, 5])
++
++    def get_local_rank(self):
++        return self.rank
++
++    def get_group(self):
++        return "test-infer-tp-group"
++
++
++class TestPreservedWeightUpdate(unittest.TestCase):
++    def setUp(self):
++        self.events = []
++        self.mesh = Mesh()
++        self.adapter = rollout.ServerAdapter.__new__(rollout.ServerAdapter)
++        self.adapter.device_mesh = {"infer_tp": self.mesh}
++        self.adapter._pd_role = None
++        self.adapter.config = SimpleNamespace(
++            checkpoint_engine=SimpleNamespace(update_weights_bucket_megabytes=1, backend="naive"),
++            quantization=SimpleNamespace(enabled=False),
++            engine_kwargs={},
++            data_parallel_size=1,
++            pipeline_model_parallel_size=1,
++            disaggregation=SimpleNamespace(enabled=False),
++            mtp=SimpleNamespace(enable=False, enable_rollout=False),
++        )
++        self.adapter.model_config = SimpleNamespace(
++            lora_rank=0, lora={}, hf_config=SimpleNamespace(model_type="test", quantization_config=None)
++        )
++        self.adapter._init_server_adapter = AsyncMock()
++        self.publish = AsyncMock(side_effect=lambda step: self.events.append(("publish", step)))
++        self.adapter.server_actor = SimpleNamespace(set_global_steps=SimpleNamespace(remote=self.publish))
++        self.transport = AsyncMock(side_effect=self.request)
++        self.engine = SimpleNamespace(
++            _make_async_request=self.transport,
++            flush_cache=AsyncMock(side_effect=lambda: self.events.append(("flush",))),
++            resume_memory_occupation=AsyncMock(),
++        )
++        self.adapter._engine = self.engine
++        self.gathers = []
++        self.preprocessed = []
++
++        async def buckets(weights, _bucket_bytes, fusion_groups=()):
++            for item in weights:
++                yield [item]
++
++        def gather(*, obj, object_gather_list, dst, group):
++            self.gathers.append((obj, dst, group))
++            if object_gather_list is not None:
++                object_gather_list[:] = [
++                    obj,
++                    [(name, pickle.dumps(TensorValue("peer:" + pickle.loads(value).value))) for name, value in obj],
++                ]
++
++        def preprocess(tensor):
++            self.preprocessed.append(tensor.value)
++            return tensor
++
++        for context in [
++            patch.object(rollout, "_preserved_weight_update_uses_session", return_value=True),
++            patch.object(rollout, "get_named_tensor_buckets", buckets),
++            patch.object(rollout, "_preprocess_tensor_for_update_weights", preprocess),
++            patch.object(rollout, "_to_ipc_device", lambda tensor: tensor),
++            patch.object(MultiprocessingSerializer, "serialize", side_effect=pickle.dumps),
++            patch.object(patch_torch, "monkey_patch_torch_reductions"),
++            patch.object(dist, "gather_object", side_effect=gather),
++            patch.object(dist, "broadcast_object_list", side_effect=self.broadcast),
++        ]:
++            context.start()
++            self.addCleanup(context.stop)
++
++    async def request(self, endpoint, payload):
++        self.events.append((endpoint, payload))
++        return {"success": True, "message": "Success"}
++
++    @staticmethod
++    def broadcast(outcome, *, src, group):
++        # Single-participant tests supply the other rank's successful control vote.
++        if outcome[0] is None:
++            outcome[0] = True
++
++    @staticmethod
++    def weights():
++        return iter([("layer.a", TensorValue("A")), ("layer.b", TensorValue("B"))])
++
++    def run_update(self, weights=None, **kwargs):
++        return asyncio.run(self.adapter.update_weights(self.weights() if weights is None else weights, **kwargs))
++
++    def assert_no_publication_or_cleanup(self):
++        self.publish.assert_not_awaited()
++        self.engine.flush_cache.assert_not_awaited()
++        self.engine.resume_memory_occupation.assert_not_awaited()
++
++    def test_preserves_every_bucket_and_publishes_only_after_session_end(self):
++        self.run_update(global_steps=12, preserve_kv_cache=True)
++        self.assertEqual(
++            [event[0] for event in self.events],
++            [
++                "begin_weight_update",
++                "update_weights_from_tensor",
++                "update_weights_from_tensor",
++                "end_weight_update",
++                "publish",
++            ],
++        )
++        self.assertEqual(self.events[0][1], {"selector": "all"})
++        self.assertEqual(self.events[-2][1], {})
++        decoded = []
++        for endpoint, payload in self.events[1:3]:
++            self.assertEqual(endpoint, "update_weights_from_tensor")
++            self.assertIs(payload["flush_cache"], False)
++            self.assertIs(payload["abort_all_requests"], False)
++            self.assertIsNone(payload["load_format"])
++            self.assertEqual(len(payload["serialized_named_tensors"]), 2)
++            tensors = pickle.loads(base64.b64decode(payload["serialized_named_tensors"][0]))
++            decoded.extend((name, [pickle.loads(v).value for v in logical.values]) for name, logical in tensors)
++        self.assertEqual(decoded, [("layer.a", ["A", "peer:A"]), ("layer.b", ["B", "peer:B"])])
++        self.assertEqual(self.preprocessed, ["A", "B"])
++        self.assertEqual([(dst, group) for _, dst, group in self.gathers], [(4, "test-infer-tp-group")] * 2)
++        self.engine.flush_cache.assert_not_awaited()
++        self.engine.resume_memory_occupation.assert_not_awaited()
++
++    def test_nonleader_consumes_preprocesses_and_gathers_without_http(self):
++        self.mesh.rank = 1
++        self.adapter._engine = None
++        self.run_update(global_steps=12, preserve_kv_cache=True)
++        self.assertEqual(self.preprocessed, ["A", "B"])
++        self.assertEqual(len(self.gathers), 2)
++        self.transport.assert_not_awaited()
++        self.publish.assert_not_awaited()
++
++    def test_default_keeps_original_bucket_helper_flush_and_publication(self):
++        helper = AsyncMock()
++        with patch.object(rollout, "sgl_update_weights", helper):
++            self.run_update(global_steps=12)
++        self.assertEqual(helper.await_count, 2)
++        self.transport.assert_not_awaited()
++        self.assertEqual(self.events, [("flush",), ("publish", 12)])
++
++    def test_default_delta_keeps_original_dispatch(self):
++        helper = AsyncMock()
++        self.adapter._update_weights_delta = helper
++        weights = self.weights()
++        self.run_update(weights, wire_format="delta_flush", global_steps=12)
++        helper.assert_awaited_once_with(weights, global_steps=12)
++        self.assert_no_publication_or_cleanup()
++
++    def test_rejects_unsupported_modes_before_init_or_weight_consumption(self):
++        cases = [
++            ({"wire_format": "delta_flush"}, lambda: None),
++            ({"peft_config": {}}, lambda: None),
++            ({}, lambda: setattr(self.adapter.model_config, "lora_rank", 8)),
++            ({}, lambda: setattr(self.adapter.model_config, "lora", {"rank": 8, "merge": True})),
++            ({}, lambda: setattr(self.adapter.config, "quantization", SimpleNamespace(enabled=True))),
++            ({}, lambda: setattr(self.adapter.config, "quantization", {"linear": "FP8"})),
++            ({}, lambda: setattr(self.adapter.model_config.hf_config, "quantization_config", {"method": "fp8"})),
++            ({}, lambda: setattr(self.adapter.config, "engine_kwargs", {"sglang": {"quantization": "fp8"}})),
++            ({}, lambda: setattr(self.adapter.config, "data_parallel_size", 2)),
++            ({}, lambda: setattr(self.adapter.config, "pipeline_model_parallel_size", 2)),
++            ({}, lambda: setattr(self.adapter.config, "disaggregation", {"enabled": True})),
++            ({}, lambda: setattr(self.adapter.config, "engine_kwargs", {"sglang": {"speculative_algorithm": "EAGLE"}})),
++            ({}, lambda: setattr(self.adapter.config, "mtp", SimpleNamespace(enable=True, enable_rollout=True))),
++            ({}, lambda: setattr(self.adapter.config.checkpoint_engine, "backend", "delta")),
++        ]
++        config, model = copy.deepcopy(self.adapter.config), copy.deepcopy(self.adapter.model_config)
++        for index, (kwargs, mutate) in enumerate(cases):
++            with self.subTest(index=index):
++                self.adapter.config, self.adapter.model_config = copy.deepcopy(config), copy.deepcopy(model)
++                mutate()
++
++                def forbidden():
++                    raise AssertionError("unsupported update consumed tensors")
++                    yield
++
++                with self.assertRaises(ValueError):
++                    self.run_update(forbidden(), preserve_kv_cache=True, **kwargs)
++                self.adapter._init_server_adapter.assert_not_awaited()
++                self.transport.assert_not_awaited()
++                self.assert_no_publication_or_cleanup()
++
++    def test_begin_bucket_end_rejections_never_publish_flush_or_resume(self):
++        for failure in ("begin_weight_update", "update_weights_from_tensor", "end_weight_update"):
++            for response in ({"success": False, "message": "native rejected"}, {"message": "missing success"}):
++                with self.subTest(endpoint=failure, response=response):
++                    self.events.clear()
++
++                    async def reject(endpoint, payload, response=response, failure=failure):
++                        self.events.append((endpoint, payload))
++                        return response if endpoint == failure else {"success": True}
++
++                    self.transport.side_effect = reject
++                    with self.assertRaisesRegex(RuntimeError, failure):
++                        self.run_update(global_steps=12, preserve_kv_cache=True)
++                    self.assert_no_publication_or_cleanup()
++                    if failure != "end_weight_update":
++                        self.assertNotIn("end_weight_update", [event[0] for event in self.events])
++
++    def test_transport_failure_keeps_original_exception_and_no_cleanup(self):
++        for error in (OSError("network transport failed"), asyncio.CancelledError()):
++            with self.subTest(error=type(error).__name__):
++                self.transport.side_effect = error
++                with self.assertRaises(RuntimeError) as caught:
++                    self.run_update(global_steps=12, preserve_kv_cache=True)
++                self.assertIs(caught.exception.__cause__, error)
++                self.assert_no_publication_or_cleanup()
++
++    def test_empty_or_broken_weight_stream_never_finishes_or_publishes(self):
++        def broken():
++            yield "layer.a", TensorValue("A")
++            raise RuntimeError("weight source failed")
++
++        for weights, exception in [(iter([]), ValueError), (broken(), RuntimeError)]:
++            with self.subTest(exception=exception):
++                self.events.clear()
++                with self.assertRaises(exception):
++                    self.run_update(weights, global_steps=12, preserve_kv_cache=True)
++                self.assertNotIn("end_weight_update", [event[0] for event in self.events])
++                self.assert_no_publication_or_cleanup()
++
++    def test_two_tp_participants_stop_before_next_gather_on_control_failure(self):
++        """Actual methods, two threads; only the collective transport is a collaborator."""
++        for failure, expected_gathers in [("begin_weight_update", 0), ("second_bucket", 2), ("end_weight_update", 3)]:
++            with self.subTest(failure=failure):
++                self._check_tp_control_failure(failure, expected_gathers)
++
++    def _check_tp_control_failure(self, failure, expected_gathers):
++        self.events.clear()
++        barrier = threading.Barrier(2, timeout=3)
++        local = threading.local()
++        gathered = {}
++        control = {}
++        gather_counts = [0, 0]
++        bucket_calls = 0
++
++        def gather(*, obj, object_gather_list, dst, group):
++            rank = local.rank
++            gather_counts[rank] += 1
++            gathered[rank] = obj
++            barrier.wait()
++            if rank == 0:
++                object_gather_list[:] = [gathered[0], gathered[1]]
++            barrier.wait()
++
++        def broadcast(outcome, *, src, group):
++            rank = local.rank
++            if rank == 0:
++                control["value"] = outcome[0]
++            barrier.wait()
++            outcome[0] = control["value"]
++            barrier.wait()
++
++        async def reject(endpoint, payload):
++            nonlocal bucket_calls
++            self.events.append((endpoint, payload))
++            if endpoint == "update_weights_from_tensor":
++                bucket_calls += 1
++            rejected = endpoint == failure or (failure == "second_bucket" and bucket_calls == 2)
++            return {"success": not rejected, "message": "/private/native/detail must not be echoed"}
++
++        def participant(rank):
++            local.rank = rank
++            adapter = copy.copy(self.adapter)
++            adapter.device_mesh = {"infer_tp": Mesh(rank)}
++            adapter._engine = self.engine if rank == 0 else None
++            weights = iter([(name, TensorValue(name)) for name in ("a", "b", "c")])
++            try:
++                asyncio.run(adapter.update_weights(weights, global_steps=12, preserve_kv_cache=True))
++            except RuntimeError as exc:
++                return str(exc)
++            return "UNEXPECTED_SUCCESS"
++
++        self.transport.side_effect = reject
++        with (
++            patch.object(dist, "gather_object", side_effect=gather),
++            patch.object(dist, "broadcast_object_list", side_effect=broadcast),
++            ThreadPoolExecutor(max_workers=2) as pool,
++        ):
++            outcomes = [future.result(timeout=10) for future in [pool.submit(participant, rank) for rank in (0, 1)]]
++        self.assertEqual(gather_counts, [expected_gathers, expected_gathers])
++        self.assertEqual(outcomes[0], outcomes[1])
++        self.assertIn("failed during preserved weight update", outcomes[0])
++        self.assertNotIn("/private/native/detail", outcomes[0])
++        self.assert_no_publication_or_cleanup()
++        if failure != "end_weight_update":
++            self.assertNotIn("end_weight_update", [event[0] for event in self.events])
++
++    def test_direct_native_api_does_not_require_session_endpoints(self):
++        with patch.object(rollout, "_preserved_weight_update_uses_session", return_value=False):
++            self.run_update(global_steps=12, preserve_kv_cache=True)
++        self.assertEqual(
++            [event[0] for event in self.events],
++            ["update_weights_from_tensor", "update_weights_from_tensor", "publish"],
++        )
++        for _, payload in self.events[:-1]:
++            self.assertIs(payload["flush_cache"], False)
++            self.assertIs(payload["abort_all_requests"], False)
++        self.engine.flush_cache.assert_not_awaited()
++
++
++class TestNativePreservationCapabilities(unittest.TestCase):
++    @staticmethod
++    def schema(begin=False, end=False, missing=None):
++        pause = type("Pause", (), {"__annotations__": {"mode": Literal["abort", "retract", "in_place"]}})
++        fields = {"flush_cache": bool, "abort_all_requests": bool}
++        if missing is not None:
++            del fields[missing]
++        tensor = type("TensorUpdate", (), {"__annotations__": fields})
++        api = SimpleNamespace(PauseGenerationReqInput=pause, UpdateWeightsFromTensorReqInput=tensor)
++        if begin:
++            api.BeginWeightUpdateReqInput = object
++        if end:
++            api.EndWeightUpdateReqInput = object
++        return api
++
++    def test_released_direct_api(self):
++        with patch.object(managers, "io_struct", self.schema()):
++            self.assertFalse(rollout._preserved_weight_update_uses_session())
++
++    def test_paired_session_api(self):
++        with patch.object(managers, "io_struct", self.schema(begin=True, end=True)):
++            self.assertTrue(rollout._preserved_weight_update_uses_session())
++
++    def test_incomplete_session_is_rejected(self):
++        for begin, end in [(True, False), (False, True)]:
++            with self.subTest(begin=begin, end=end):
++                with patch.object(managers, "io_struct", self.schema(begin=begin, end=end)):
++                    with self.assertRaisesRegex(RuntimeError, "session schema is incomplete"):
++                        rollout._preserved_weight_update_uses_session()
++
++    def test_missing_preservation_flags_are_rejected(self):
++        for field in ["flush_cache", "abort_all_requests"]:
++            with self.subTest(field=field):
++                with patch.object(managers, "io_struct", self.schema(missing=field)):
++                    with self.assertRaisesRegex(RuntimeError, "lacks preservation flags"):
++                        rollout._preserved_weight_update_uses_session()
++
++    def test_retract_only_api_is_rejected(self):
++        api = self.schema()
++        api.PauseGenerationReqInput.__annotations__["mode"] = Literal["abort", "retract"]
++        with patch.object(managers, "io_struct", api):
++            with self.assertRaisesRegex(RuntimeError, "in_place pause"):
++                rollout._preserved_weight_update_uses_session()
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/workers/rollout/rollout_sglang/test_preserve_requests_on_cpu.py b/tests/workers/rollout/rollout_sglang/test_preserve_requests_on_cpu.py
+new file mode 100644
+index 000000000..ccd51c02f
+--- /dev/null
++++ b/tests/workers/rollout/rollout_sglang/test_preserve_requests_on_cpu.py
+@@ -0,0 +1,266 @@
++# Copyright 2026 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""SGLang request preservation and the shared checkpoint-engine contract.
++
++These are CPU tests of orchestration, not proof of native GPU cache reuse.
++"""
++
++import asyncio
++import inspect
++from types import SimpleNamespace
++from unittest.mock import AsyncMock
++
++import pytest
++
++pytest.importorskip("sglang")
++
++import torch
++
++from verl.checkpoint_engine import base
++from verl.workers.rollout.replica import RolloutMode
++from verl.workers.rollout.sglang_rollout import async_sglang_server
++from verl.workers.rollout.sglang_rollout.async_sglang_server import SGLangHttpServer, SGLangReplica
++
++
++@pytest.fixture(autouse=True)
++def no_cuda_initialization():
++    assert not torch.cuda.is_initialized()
++    yield
++    assert not torch.cuda.is_initialized()
++
++
++def _replica():
++    server = object.__new__(SGLangHttpServer)
++    server.node_rank = 0
++    server.tokenizer_manager = SimpleNamespace(pause_generation=AsyncMock(), continue_generation=AsyncMock())
++    handle = SimpleNamespace(
++        pause_generation=SimpleNamespace(remote=server.pause_generation),
++        resume_generation=SimpleNamespace(remote=server.resume_generation),
++    )
++    replica = object.__new__(SGLangReplica)
++    replica.config = SimpleNamespace(
++        name="sglang",
++        preserve_kv_cache=True,
++        data_parallel_size=1,
++        pipeline_model_parallel_size=1,
++        disaggregation=SimpleNamespace(enabled=False),
++        quantization=SimpleNamespace(enabled=False),
++        checkpoint_engine=SimpleNamespace(backend="nccl"),
++        engine_kwargs={},
++        mtp=None,
++    )
++    replica.model_config = SimpleNamespace(lora_rank=0, lora={}, hf_config=SimpleNamespace())
++    replica.is_multimodal = False
++    replica.rollout_mode = RolloutMode.STANDALONE
++    replica.workers = [0]
++    replica.servers = [handle]
++    replica.abort_all_requests = AsyncMock()
++    replica.release_kv_cache = AsyncMock()
++    replica.resume_kv_cache = AsyncMock()
++    return replica, server
++
++
++@pytest.mark.parametrize(
++    "unsupported",
++    [
++        None,
++        "default",
++        "hybrid",
++        "multimodal",
++        "dp",
++        "pp",
++        "pd",
++        "quantized",
++        "hf_quantized",
++        "engine_quantized",
++        "lora",
++        "delta",
++        "speculative",
++    ],
++)
++def test_shared_weight_sync_lifecycle(monkeypatch, unsupported):
++    replica, server = _replica()
++    if unsupported == "default":
++        replica.config.preserve_kv_cache = False
++    elif unsupported == "hybrid":
++        replica.rollout_mode = RolloutMode.HYBRID
++    elif unsupported == "multimodal":
++        replica.is_multimodal = True
++    elif unsupported in ("dp", "pp"):
++        setattr(replica.config, "data_parallel_size" if unsupported == "dp" else "pipeline_model_parallel_size", 2)
++    elif unsupported == "pd":
++        replica.config.disaggregation.enabled = True
++    elif unsupported == "quantized":
++        replica.config.quantization.enabled = True
++    elif unsupported == "hf_quantized":
++        replica.model_config.hf_config.quantization_config = {"quant_method": "fp8"}
++    elif unsupported == "engine_quantized":
++        replica.config.engine_kwargs = {"sglang": {"quantization": "fp8"}}
++    elif unsupported == "lora":
++        replica.model_config.lora = {"rank": 8, "merge": True}
++    elif unsupported == "delta":
++        replica.config.checkpoint_engine.backend = "nccl_delta"
++    elif unsupported == "speculative":
++        replica.config.engine_kwargs = {"sglang": {"speculative_algorithm": "EAGLE"}}
++    events = []
++
++    class WorkerGroup:
++        world_size = 1
++
++        def __init__(self, **kwargs):
++            pass
++
++        def update_weights(self, **kwargs):
++            events.append(("transfer", kwargs))
++            return [{}]
++
++        def execute_checkpoint_engine(self, methods):
++            events.append(("finalize", methods))
++            return [None]
++
++    monkeypatch.setattr(base, "RayWorkerGroup", WorkerGroup)
++    monkeypatch.setattr(base.ray, "get", lambda refs: refs)
++    manager = object.__new__(base.CheckpointEngineManager)
++    manager.backend = "nccl"
++    manager.replicas = [replica]
++    manager.actor_wg = WorkerGroup()
++    manager.build_process_group = lambda workers: events.append(("prepare", None))
++    manager.abort_replicas = AsyncMock(side_effect=replica.abort_all_requests)
++    manager.release_kv_cache_replicas = AsyncMock(side_effect=replica.release_kv_cache)
++    manager.resume_kv_cache_replicas = AsyncMock(side_effect=replica.resume_kv_cache)
++    manager.resume_generation_replicas = replica.resume_generation
++    asyncio.run(inspect.unwrap(base.CheckpointEngineManager.update_weights)(manager, global_steps=8))
++
++    receiver_options = next(options for name, options in events if name == "transfer" and "mode" not in options)
++    assert receiver_options == (
++        {"global_steps": 8, "preserve_kv_cache": True} if unsupported is None else {"global_steps": 8}
++    )
++    assert [name for name, _ in events] == ["prepare", "transfer", "transfer", "finalize", "finalize"]
++    if unsupported is None:
++        manager.abort_replicas.assert_not_awaited()
++        manager.release_kv_cache_replicas.assert_not_awaited()
++        manager.resume_kv_cache_replicas.assert_not_awaited()
++        assert server.tokenizer_manager.pause_generation.await_args.args[0].mode == "in_place"
++    else:
++        manager.abort_replicas.assert_awaited_once()
++        manager.release_kv_cache_replicas.assert_awaited_once()
++        manager.resume_kv_cache_replicas.assert_awaited_once()
++        server.tokenizer_manager.pause_generation.assert_not_awaited()
++    server.tokenizer_manager.continue_generation.assert_awaited_once()
++
++
++def test_non_primary_server_does_not_control_scheduler():
++    _, server = _replica()
++    server.node_rank = 1
++    asyncio.run(server.pause_generation())
++    asyncio.run(server.resume_generation())
++    server.tokenizer_manager.pause_generation.assert_not_awaited()
++    server.tokenizer_manager.continue_generation.assert_not_awaited()
++
++
++@pytest.mark.parametrize(
++    "preserve,mode,prefix,salt,expected",
++    [
++        (False, "versioned", True, None, None),
++        (True, "versioned", True, None, "8"),
++        (True, "versioned", True, "", "8"),
++        (True, "versioned", True, "task-2", "task-2"),
++        (True, "shared", True, "task-2", None),
++        (True, "versioned", False, "task-2", None),
++    ],
++)
++def test_request_namespace_and_preserved_output(monkeypatch, preserve, mode, prefix, salt, expected):
++    _, server = _replica()
++    server._disaggregation_role = "null"
++    server._pd_decode_peers = []
++    server.global_steps = 8
++    server.model_config = SimpleNamespace(lora_rank=0, lora={})
++    monkeypatch.setattr(
++        async_sglang_server.ray,
++        "get_runtime_context",
++        lambda: SimpleNamespace(get_actor_name=lambda: "unit-test-server"),
++    )
++    server.config = SimpleNamespace(
++        preserve_kv_cache=preserve,
++        prefix_cache_mode=mode,
++        enable_prefix_caching=prefix,
++        max_model_len=1024,
++        prompt_length=32,
++        response_length=128,
++        enable_rollout_routing_replay=False,
++        mtp=None,
++    )
++    requests = []
++
++    async def generate(request, _):
++        requests.append(request)
++        server.global_steps = 9
++        yield {
++            "output_ids": [11, 12, 13],
++            "meta_info": {
++                "output_token_logprobs": [(-0.1, 11, None), (-0.2, 12, None), (-0.3, 13, None)],
++                "finish_reason": {"type": "length"},
++            },
++        }
++
++    server.tokenizer_manager.generate_request = generate
++    output = asyncio.run(server.generate([1, 2], {"max_new_tokens": 3, "logprobs": True}, "rid-1", cache_salt=salt))
++    assert getattr(requests[0], "cache_salt", None) == expected
++    assert output.token_ids == [11, 12, 13]
++    assert output.log_probs == [-0.1, -0.2, -0.3]
++    assert output.stop_reason == "length"
++    if preserve:
++        assert output.extra_fields["min_global_steps"] == 8
++        assert output.extra_fields["max_global_steps"] == 9
++    else:
++        assert output.extra_fields == {"global_steps": 9}
++    assert output.extra_fields.get("cache_salt") == expected
++
++
++@pytest.mark.parametrize("failure", ["prepare", "transfer", "finalize"])
++def test_failed_weight_sync_keeps_requests_paused(monkeypatch, failure):
++    replica, server = _replica()
++
++    def fail():
++        raise RuntimeError("injected weight-sync failure")
++
++    class WorkerGroup:
++        world_size = 1
++
++        def __init__(self, **kwargs):
++            pass
++
++        def update_weights(self, **kwargs):
++            if failure == "transfer":
++                fail()
++            return [None]
++
++        def execute_checkpoint_engine(self, methods):
++            if failure == "finalize":
++                fail()
++            return [None]
++
++    monkeypatch.setattr(base, "RayWorkerGroup", WorkerGroup)
++    monkeypatch.setattr(base.ray, "get", lambda refs: refs)
++    manager = object.__new__(base.CheckpointEngineManager)
++    manager.backend = "nccl"
++    manager.replicas = [replica]
++    manager.actor_wg = WorkerGroup()
++    manager.build_process_group = lambda workers: fail() if failure == "prepare" else None
++    manager.resume_generation_replicas = replica.resume_generation
++    with pytest.raises(RuntimeError, match="injected weight-sync failure"):
++        asyncio.run(inspect.unwrap(base.CheckpointEngineManager.update_weights)(manager, global_steps=9))
++    server.tokenizer_manager.pause_generation.assert_awaited_once()
++    server.tokenizer_manager.continue_generation.assert_not_awaited()
++    replica.release_kv_cache.assert_not_awaited()
+diff --git a/verl/checkpoint_engine/base.py b/verl/checkpoint_engine/base.py
+index 50a3faa58..290688688 100644
+--- a/verl/checkpoint_engine/base.py
++++ b/verl/checkpoint_engine/base.py
+@@ -523,7 +523,7 @@ class CheckpointEngineManager:
+             return {}
+ 
+         preserve_kv_cache = all(
+-            r.config.name == "vllm"
++            (r.config.name == "vllm" or (r.config.name == "sglang" and r.supports_preserved_weight_updates))
+             and r.config.preserve_kv_cache
+             and r.rollout_mode == RolloutMode.STANDALONE
+             and not r.config.disaggregation.enabled
+diff --git a/verl/workers/config/rollout.py b/verl/workers/config/rollout.py
+index 9b35bbe37..1a5bec23e 100644
+--- a/verl/workers/config/rollout.py
++++ b/verl/workers/config/rollout.py
+@@ -288,7 +288,7 @@ class RolloutConfig(BaseConfig):
+ 
+     enable_prefix_caching: bool = True
+ 
+-    # Retain standalone vLLM requests and KV across weight updates.
++    # Retain supported standalone vLLM/SGLang requests and KV across weight updates.
+     preserve_kv_cache: bool = False
+ 
+     # Prefix sharing when preserving KV: task's starting weight version, or across versions.
+diff --git a/verl/workers/rollout/sglang_rollout/async_sglang_server.py b/verl/workers/rollout/sglang_rollout/async_sglang_server.py
+index b74af031d..785511a43 100644
+--- a/verl/workers/rollout/sglang_rollout/async_sglang_server.py
++++ b/verl/workers/rollout/sglang_rollout/async_sglang_server.py
+@@ -163,6 +163,8 @@ class SGLangHttpServer:
+         self._disaggregation_bootstrap_port = disaggregation_bootstrap_port
+ 
+         self.config: RolloutConfig = omega_conf_to_dataclass(config)
++        if self.config.preserve_kv_cache and self.config.prefix_cache_mode not in ("versioned", "shared"):
++            raise ValueError("prefix_cache_mode must be 'versioned' or 'shared'")
+         self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config, dataclass_type=HFModelConfig)
+         max_position_embeddings = get_max_position_embeddings(self.model_config.hf_config)
+         if self.config.max_model_len is None:
+@@ -335,6 +337,9 @@ class SGLangHttpServer:
+             **engine_kwargs,
+         }
+         # bf16 weight updates crash SGLang's default MoE runner on Blackwell (see default_moe_runner_backend)
++        if self.config.preserve_kv_cache:
++            args["disable_radix_cache"] = not self.config.enable_prefix_caching
++
+         moe_runner_backend = default_moe_runner_backend(quantization_config, engine_kwargs, self.model_config.hf_config)
+         if moe_runner_backend is not None:
+             args["moe_runner_backend"] = moe_runner_backend
+@@ -529,6 +534,7 @@ class SGLangHttpServer:
+         bootstrap_port: Optional[int] = None,
+         bootstrap_room: Optional[int] = None,
+         session_id: Optional[str] = None,
++        cache_salt: Optional[str] = None,
+     ) -> TokenOutput:
+         # PD top-level dispatch: prefill mints a bootstrap_room and fans out
+         # paired local-prefill + remote-decode calls; decode returns the tokens
+@@ -589,6 +595,7 @@ class SGLangHttpServer:
+         )
+         sampling_params["max_new_tokens"] = max_new_tokens
+         return_logprob = sampling_params.pop("logprobs", False)
++        start_global_steps = self.global_steps
+ 
+         # vLLM-style "prompt_logprobs=K" from the distillation teacher: request
+         # input-token logprobs for every position (top-K when K>0, sampled-token
+@@ -608,6 +615,15 @@ class SGLangHttpServer:
+             # or a dict. Dropping it silently makes the model answer video questions blind.
+             "video_data": video_data,
+         }
++        if (
++            self.config.preserve_kv_cache
++            and self.config.enable_prefix_caching
++            and self.config.prefix_cache_mode == "versioned"
++        ):
++            if cache_salt is not None and not isinstance(cache_salt, str):
++                raise ValueError("cache_salt must be a string")
++            # SGLang normalizes an empty salt to None, which disables isolation.
++            request["cache_salt"] = cache_salt or str(start_global_steps)
+ 
+         if prompt_logprobs is not None:
+             request["logprob_start_len"] = 0
+@@ -677,6 +693,14 @@ class SGLangHttpServer:
+                 )
+ 
+         extra_fields = {"global_steps": self.global_steps}
++        if self.config.preserve_kv_cache:
++            versions = [step for step in (start_global_steps, self.global_steps) if step is not None]
++            extra_fields.update(
++                min_global_steps=min(versions) if versions else None,
++                max_global_steps=max(versions) if versions else None,
++            )
++            if "cache_salt" in request:
++                extra_fields["cache_salt"] = request["cache_salt"]
+         if prompt_logprobs is not None:
+             _extract_prompt_logprobs_sglang(
+                 meta_info=meta_info,
+@@ -710,6 +734,11 @@ class SGLangHttpServer:
+             return
+         await self.tokenizer_manager.pause_generation(PauseGenerationReqInput(mode="abort"))
+ 
++    async def pause_generation(self):
++        """Pause the native scheduler without retracting requests or releasing KV."""
++        if self.node_rank == 0:
++            await self.tokenizer_manager.pause_generation(PauseGenerationReqInput(mode="in_place"))
++
+     async def resume_generation(self):
+         if self.node_rank != 0:
+             return
+@@ -856,6 +885,11 @@ class SGLangReplica(RolloutReplica):
+             ]
+         )
+ 
++        if self.config.preserve_kv_cache:
++            self.is_multimodal = await self.servers[0].__ray_call__.remote(
++                lambda server: server.tokenizer_manager.model_config.is_multimodal
++            )
++
+         # get http server address from first server
+         server_address, server_port = await self.servers[0].get_server_address.remote()
+         self._server_handle = self.servers[0]
+@@ -865,6 +899,26 @@ class SGLangReplica(RolloutReplica):
+             else f"{server_address}:{server_port}"
+         )
+ 
++    @property
++    def supports_preserved_weight_updates(self):
++        """Restrict preservation to standalone, unquantized full-weight replicas."""
++        engine_kwargs = self.config.engine_kwargs.get("sglang", {}) or {}
++        return (
++            self.config.data_parallel_size == 1
++            and self.config.pipeline_model_parallel_size == 1
++            and not self.config.quantization.enabled
++            and not getattr(self.model_config.hf_config, "quantization_config", None)
++            and not engine_kwargs.get("quantization")
++            and not engine_kwargs.get("speculative_algorithm")
++            and not (self.config.mtp and self.config.mtp.enable and self.config.mtp.enable_rollout)
++            and not (self.model_config.lora_rank > 0 or self.model_config.lora.get("rank", 0) > 0)
++            and "delta" not in str(self.config.checkpoint_engine.backend)
++        )
++
++    async def pause_generation(self):
++        """Pause through the primary owner of the replica's native scheduler."""
++        await self.servers[0].pause_generation.remote()
++
+     async def abort_all_requests(self, reject_request: bool = False):
+         """Abort all ongoing generation requests on the primary server.
+ 
+diff --git a/verl/workers/rollout/sglang_rollout/sglang_rollout.py b/verl/workers/rollout/sglang_rollout/sglang_rollout.py
+index c80c0a395..b937bbe2a 100644
+--- a/verl/workers/rollout/sglang_rollout/sglang_rollout.py
++++ b/verl/workers/rollout/sglang_rollout/sglang_rollout.py
+@@ -15,9 +15,11 @@
+ # limitations under the License.
+ from __future__ import annotations
+ 
++import asyncio
+ import logging
+ import multiprocessing as mp
+ import os
++from collections.abc import Mapping
+ from typing import Generator
+ 
+ import ray
+@@ -114,6 +116,28 @@ sglang.srt.entrypoints.engine._set_envs_and_config = _set_envs_and_config
+ 
+ # because chatCompletion is an async method, it makes the whole ray actor be an async actor
+ # which can not call loop.run_until_complete. So we need to make the engine to be an async class
++def _preserved_weight_update_uses_session() -> bool:
++    """Validate native preservation controls before consuming any weight tensors."""
++    from typing import get_args, get_type_hints
++
++    from sglang.srt.managers import io_struct
++
++    try:
++        pause = get_type_hints(io_struct.PauseGenerationReqInput)
++        tensor = get_type_hints(io_struct.UpdateWeightsFromTensorReqInput)
++    except (AttributeError, NameError, TypeError) as exc:
++        raise RuntimeError("Cannot inspect native SGLang preservation controls") from exc
++    if "in_place" not in get_args(pause.get("mode")):
++        raise RuntimeError("Native SGLang does not expose in_place pause")
++    if not {"flush_cache", "abort_all_requests"}.issubset(tensor):
++        raise RuntimeError("Native SGLang tensor update lacks preservation flags")
++    begin = getattr(io_struct, "BeginWeightUpdateReqInput", None) is not None
++    end = getattr(io_struct, "EndWeightUpdateReqInput", None) is not None
++    if begin != end:
++        raise RuntimeError("Native SGLang weight-update session schema is incomplete")
++    return begin
++
++
+ class ServerAdapter(BaseRollout):
+     """SGLang server adapter used in native http server mode, serve as http client to request SGLang server
+     to resume/release/update weights and kv_cache.
+@@ -296,6 +320,7 @@ class ServerAdapter(BaseRollout):
+         weights: Generator[tuple[str, torch.Tensor], None, None],
+         global_steps: int = None,
+         wire_format: str = "named_tensors",
++        preserve_kv_cache: bool = False,
+         **kwargs,
+     ):
+         """
+@@ -310,8 +335,15 @@ class ServerAdapter(BaseRollout):
+             - Main logic: https://github.com/THUDM/slime/blob/fb7605cc5fb09af0f9369d37f7192f12bddee577/slime/ray/ppo_actor.py#L452
+             - runtime envs: https://github.com/THUDM/slime/blob/fb7605cc5fb09af0f9369d37f7192f12bddee577/slime/ray/ppo_actor.py#L39
+         """
++        if preserve_kv_cache:
++            self._validate_preserved_weight_update(wire_format, kwargs.get("peft_config"))
++            uses_session = _preserved_weight_update_uses_session()
+         await self._init_server_adapter()
+ 
++        if preserve_kv_cache:
++            await self._update_weights_preserving_cache(weights, global_steps, uses_session=uses_session)
++            return
++
+         # Delta checkpoint-engine wire (standalone replicas): the generator yields
+         # per-flush sparse payloads, applied in place through the verl custom
+         # weight loader. Hybrid replicas pass full (name, tensor) pairs with no
+@@ -366,6 +398,152 @@ class ServerAdapter(BaseRollout):
+             if global_steps is not None:
+                 await self.server_actor.set_global_steps.remote(global_steps)
+ 
++    def _validate_preserved_weight_update(self, wire_format, peft_config) -> None:
++        """Reject unsupported modes before initializing or consuming the weight stream."""
++
++        def value(obj, key, default=None):
++            return obj.get(key, default) if isinstance(obj, Mapping) else getattr(obj, key, default)
++
++        quantization = value(self.config, "quantization")
++        engine_config = value(value(self.config, "engine_kwargs", {}), "sglang", {})
++        lora = value(self.model_config, "lora", {})
++        if wire_format != "named_tensors":
++            raise ValueError("preserve_kv_cache requires a complete named_tensors weight update")
++        if peft_config is not None or value(self.model_config, "lora_rank", 0) or value(lora, "rank", 0):
++            raise ValueError("preserve_kv_cache does not support LoRA weight updates")
++        if (
++            value(quantization, "enabled", False)
++            or any(value(quantization, field) for field in ("linear", "moe", "config_file"))
++            or value(value(self.model_config, "hf_config"), "quantization_config")
++            or value(engine_config, "quantization")
++        ):
++            raise ValueError("preserve_kv_cache does not support quantized weight updates")
++        if (
++            value(self.config, "data_parallel_size", 1) != 1
++            or value(self.config, "pipeline_model_parallel_size", 1) != 1
++            or value(value(self.config, "disaggregation"), "enabled", False)
++        ):
++            raise ValueError("preserve_kv_cache requires DP1/PP1 without PD disaggregation")
++        mtp = value(self.config, "mtp")
++        if value(engine_config, "speculative_algorithm") or (
++            value(mtp, "enable", False) and value(mtp, "enable_rollout", False)
++        ):
++            raise ValueError("preserve_kv_cache does not support speculative or MTP decoding")
++        if "delta" in str(value(value(self.config, "checkpoint_engine"), "backend", "")):
++            raise ValueError("preserve_kv_cache does not support delta weight updates")
++
++    async def _preserved_weight_update_request(self, endpoint, payload) -> None:
++        """Keep all TP participants on the same control path after a leader RPC."""
++        import torch.distributed as dist
++
++        mesh = self.device_mesh["infer_tp"]
++        leader = mesh.get_local_rank() == 0
++        outcome = [None]
++        error = None
++        if leader:
++            try:
++                if self._engine is None:
++                    raise RuntimeError("Missing TP leader server adapter")
++                result = await self._engine._make_async_request(endpoint, payload() if callable(payload) else payload)
++                if not isinstance(result, dict) or result.get("success") is not True:
++                    raise RuntimeError(f"SGLang {endpoint} rejected the preserved weight update")
++                outcome[0] = True
++            except (Exception, asyncio.CancelledError) as exc:
++                error = exc
++                outcome[0] = False
++        # Do not let nonleaders enter the next IPC gather when TP0 failed. The
++        # control wire carries no native response payload or private error path.
++        dist.broadcast_object_list(outcome, src=mesh.mesh.tolist()[0], group=mesh.get_group())
++        if outcome[0] is not True:
++            raise RuntimeError(f"SGLang {endpoint} failed during preserved weight update") from error
++
++    async def _update_weights_preserving_cache(self, weights, global_steps, uses_session=True) -> None:
++        """Load complete full weights while the caller keeps generation paused in place.
++
++        A native session is used only when both session schemas are available.
++        A failed load leaves the caller's pause intact; only a completed update
++        may publish the new step. This method never flushes, aborts, or resumes requests.
++        """
++        leader = self._is_server_tp_leader()
++        if uses_session:
++            await self._preserved_weight_update_request("begin_weight_update", {"selector": "all"})
++
++        bucket_bytes = int(self.config.checkpoint_engine.update_weights_bucket_megabytes) << 20
++        fusion_groups = (
++            DEEPSEEK_V4_FUSION_GROUPS
++            if getattr(self.model_config.hf_config, "model_type", None) == "deepseek_v4"
++            else ()
++        )
++        applied = 0
++        async for params_batch in get_named_tensor_buckets(weights, bucket_bytes, fusion_groups=fusion_groups):
++            await self._update_weights_preserved_bucket(params_batch)
++            applied += 1
++        if not applied:
++            raise ValueError("preserve_kv_cache requires a nonempty complete weight update")
++
++        # Native APIs with a session finalize weights without flushing KV.
++        if uses_session:
++            await self._preserved_weight_update_request("end_weight_update", {})
++        if leader:
++            if global_steps is not None:
++                await self.server_actor.set_global_steps.remote(global_steps)
++
++    async def _update_weights_preserved_bucket(self, params_batch) -> None:
++        """Use the existing TP gather/IPC wire with a non-flushing full-weight load."""
++        import base64
++
++        import torch.distributed as dist
++        from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
++        from sglang.srt.utils import MultiprocessingSerializer
++        from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
++
++        try:
++            from sglang.srt.model_executor.model_runner import LocalSerializedTensor
++        except ImportError:
++            from sglang.srt.model_executor.model_runner_components.weight_updater import LocalSerializedTensor
++
++        monkey_patch_torch_reductions()
++        mesh = self.device_mesh["infer_tp"]
++        tp_size = mesh.mesh.size()[0]
++        serialized = [
++            (
++                _strip_lora_base_layer(name),
++                MultiprocessingSerializer.serialize(_to_ipc_device(_preprocess_tensor_for_update_weights(t.detach()))),
++            )
++            for name, t in params_batch
++        ]
++        gathered = [None for _ in range(tp_size)] if mesh.get_local_rank() == 0 else None
++        dist.gather_object(
++            obj=serialized,
++            object_gather_list=gathered,
++            dst=mesh.mesh.tolist()[0],
++            group=mesh.get_group(),
++        )
++
++        def payload():
++            named_tensors = [
++                (group[0][0], LocalSerializedTensor(values=[part[1] for part in group]))
++                for group in zip(*gathered, strict=True)
++            ]
++            req = UpdateWeightsFromTensorReqInput(
++                serialized_named_tensors=[MultiprocessingSerializer.serialize(named_tensors) for _ in range(tp_size)],
++                load_format=None,
++                flush_cache=False,
++                abort_all_requests=False,
++            )
++            return {
++                "serialized_named_tensors": [
++                    base64.b64encode(part).decode("utf-8") for part in req.serialized_named_tensors
++                ],
++                "load_format": req.load_format,
++                "flush_cache": req.flush_cache,
++                "abort_all_requests": req.abort_all_requests,
++            }
++
++        # The generic HTTP wrapper omits abort_all_requests; send the full native
++        # contract explicitly instead of allowing its bucket-level flush default.
++        await self._preserved_weight_update_request("update_weights_from_tensor", payload)
++
+     async def _update_weights_delta(self, flushes, global_steps: int = None) -> None:
+         """Apply the delta engine's sparse flushes in place.
+ 

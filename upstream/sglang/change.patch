@@ -1,0 +1,4435 @@
+diff --git a/examples/runtime/token_kv_restore.py b/examples/runtime/token_kv_restore.py
+new file mode 100644
+index 0000000000..6bd83ba822
+--- /dev/null
++++ b/examples/runtime/token_kv_restore.py
+@@ -0,0 +1,541 @@
++"""Export a paused hybrid request, then restore it on a different native server.
++
++This is a functional HTTP reproducer, not a training or throughput benchmark.
++Run only against dedicated test servers. It never launches or kills a server.
++The export command intentionally leaves its source paused after releasing the
++request's private slots. Stop that source through its original process owner
++before resuming on a newly started server. Snapshot files must be accessible at
++one identical trusted filesystem path on all participating ranks and servers.
++"""
++
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import math
++import os
++import threading
++import time
++from pathlib import Path
++from urllib.error import HTTPError
++from urllib.request import Request, urlopen
++from uuid import uuid4
++
++
++def require(value, message):
++    if not value:
++        raise ValueError(message)
++
++
++def file_ref(path):
++    path = Path(path)
++    raw = path.read_bytes()
++    return {
++        "path": str(path),
++        "bytes": len(raw),
++        "sha256": hashlib.sha256(raw).hexdigest(),
++    }
++
++
++def write_json(path, value):
++    path = Path(path)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    temp = path.with_suffix(path.suffix + ".tmp")
++    temp.write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False))
++    os.replace(temp, path)
++
++
++class HTTP:
++    def __init__(self, url, out, timeout):
++        self.url, self.out, self.timeout = url.rstrip("/"), Path(out), timeout
++        self.out.mkdir(parents=True, exist_ok=True)
++        self.refs = []
++        self.counter = 0
++
++    def call(self, route, payload=None):
++        request = Request(
++            self.url + route,
++            data=json.dumps(payload, allow_nan=False).encode()
++            if payload is not None
++            else None,
++            headers={"Content-Type": "application/json"},
++        )
++        started = time.perf_counter()
++        try:
++            with urlopen(request, timeout=self.timeout) as response:
++                raw = response.read()
++                status = response.status
++        except HTTPError as error:
++            raw, status = error.read(), error.code
++        self.counter += 1
++        path = (
++            self.out
++            / f"http-{self.counter:04d}-{route.strip('/').replace('/', '-')}.json"
++        )
++        record = {
++            "route": route,
++            "payload": payload,
++            "status": status,
++            "elapsed_s": time.perf_counter() - started,
++            "body": raw.decode("utf-8", errors="replace"),
++        }
++        write_json(path, record)
++        self.refs.append(file_ref(path))
++        if status < 200 or status >= 300:
++            raise RuntimeError(f"{route}: HTTP {status}; immutable response: {path}")
++        value = json.loads(raw)
++        if isinstance(value, dict) and value.get("error"):
++            raise RuntimeError(f"{route}: engine error; immutable response: {path}")
++        return value, record["elapsed_s"]
++
++
++def token_output(row):
++    meta = row.get("meta_info", {})
++    pairs = meta.get("output_token_logprobs")
++    if not isinstance(pairs, list):
++        raise ValueError("Actual SGLang token IDs and behavior logprobs are missing")
++    ids, probs = [], []
++    for entry in pairs:
++        if not isinstance(entry, (list, tuple)) or len(entry) < 2:
++            raise ValueError("Invalid native output_token_logprobs entry")
++        prob, token = entry[:2]
++        if (
++            type(token) is not int
++            or token < 0
++            or type(prob) not in (int, float)
++            or not math.isfinite(prob)
++            or prob > 1e-5
++        ):
++            raise ValueError("Native token/logprob entry is not finite and valid")
++        ids.append(token)
++        probs.append(prob)
++    reason = meta.get("finish_reason")
++    if isinstance(reason, dict):
++        reason = reason.get("type")
++    spans = meta.get("weight_versions", meta.get("weight_version_spans"))
++    version = meta.get("weight_version")
++    if spans is not None:
++        if not isinstance(spans, list) or not spans:
++            raise ValueError("Invalid native weight version spans")
++        cursor = 0
++        versions = set()
++        for span in spans:
++            if (
++                not isinstance(span, dict)
++                or type(span.get("start")) is not int
++                or type(span.get("end")) is not int
++                or span["start"] != cursor
++                or span["end"] < cursor
++                or span["end"] > len(ids)
++                or span.get("version") is None
++            ):
++                raise ValueError(
++                    "Native version spans do not cover actual generated tokens"
++                )
++            cursor = span["end"]
++            versions.add(span["version"])
++        if cursor != len(ids) or len(versions) != 1:
++            raise ValueError(
++                "Attempt contains mixed or incompletely observed model versions"
++            )
++        observed = next(iter(versions))
++        if version is not None and observed != version:
++            raise ValueError(
++                "Scalar version disagrees with original native version spans"
++            )
++        version = observed
++    return {
++        "token_ids": ids,
++        "logprobs": probs,
++        "stop_reason": reason,
++        "weight_version": version,
++        "raw_meta": meta,
++    }
++
++
++class SSE:
++    def __init__(self, http, payload, stem):
++        self.http, self.payload = http, payload
++        self.path = http.out / (stem + ".jsonl")
++        self.condition = threading.Condition()
++        self.events, self.error, self.done = [], None, False
++        self.start_s = time.perf_counter()
++        self.thread = threading.Thread(target=self._read, daemon=True)
++        self.thread.start()
++
++    def _read(self):
++        request = Request(
++            self.http.url + "/generate",
++            data=json.dumps(self.payload).encode(),
++            headers={"Content-Type": "application/json"},
++        )
++        try:
++            with (
++                urlopen(request, timeout=self.http.timeout) as response,
++                self.path.open("w") as out,
++            ):
++                for line in response:
++                    if not line.startswith(b"data:"):
++                        continue
++                    data = line[5:].strip()
++                    if data == b"[DONE]":
++                        continue
++                    row = json.loads(data)
++                    if row.get("error"):
++                        raise RuntimeError("SGLang stream returned an engine error")
++                    event = {"monotonic_s": time.perf_counter(), "raw": row}
++                    out.write(json.dumps(event, allow_nan=False) + "\n")
++                    out.flush()
++                    with self.condition:
++                        self.events.append(event)
++                        self.condition.notify_all()
++        except HTTPError as error:
++            body = error.read().decode("utf-8", errors="replace")
++            write_json(
++                self.path.with_suffix(".error.json"),
++                {"status": error.code, "body": body},
++            )
++            self.error = RuntimeError(f"generate HTTP {error.code}: {body}")
++        except BaseException as error:
++            self.error = error
++        finally:
++            with self.condition:
++                self.done = True
++                self.condition.notify_all()
++
++    def wait_tokens(self, count, after=None):
++        deadline = time.monotonic() + self.http.timeout
++        with self.condition:
++            while True:
++                for event in self.events:
++                    if after is not None and event["monotonic_s"] <= after:
++                        continue
++                    actual = event["raw"].get("meta_info", {}).get("completion_tokens")
++                    if type(actual) is int and actual >= count:
++                        return event
++                if self.done:
++                    raise RuntimeError(
++                        f"Actual request ended before token {count}"
++                    ) from self.error
++                left = deadline - time.monotonic()
++                if left <= 0:
++                    raise TimeoutError(f"No actual SSE token {count}")
++                self.condition.wait(min(left, 1))
++
++    def finish(self):
++        self.thread.join(self.http.timeout)
++        if self.thread.is_alive():
++            raise TimeoutError("Actual SGLang generation did not finish")
++        if self.error:
++            raise RuntimeError("Actual SGLang generation failed") from self.error
++        if not self.events:
++            raise ValueError("No SGLang generation output")
++        self.http.refs.append(file_ref(self.path))
++        return self.events[-1]
++
++
++def identity_from_inspect(value):
++    identity = value.get("identity")
++    if not isinstance(identity, dict):
++        raise ValueError("Snapshot inspect did not return engine-generated identity")
++    if not identity.get("model_path") or not identity.get(
++        "actual_model_config_file_sha256"
++    ):
++        raise ValueError("Snapshot identity has no actual model_path/config SHA")
++    if identity.get("weight_version") is None:
++        raise ValueError("Actual engine weight_version is missing")
++    return identity
++
++
++def source_prefix(ack):
++    ids = ack.get("output_ids")
++    probs = ack.get("output_logprobs")
++    if (
++        not isinstance(ids, list)
++        or not isinstance(probs, list)
++        or len(ids) != len(probs)
++    ):
++        raise ValueError(
++            "Snapshot ACK has no actual generated token/logprob checkpoint"
++        )
++    return {"token_ids": ids, "logprobs": probs}
++
++
++def rank_rows(value, tp_size):
++    rows = value.get("ranks", [])
++    require(len(rows) == tp_size, "Missing TP rank responses")
++    by_rank = {row.get("tp_rank"): row for row in rows}
++    require(set(by_rank) == set(range(tp_size)), "Duplicate or foreign TP rank")
++    require(
++        all(row.get("status") == "PASS" for row in rows),
++        "A native rank rejected the operation",
++    )
++    return by_rank
++
++
++def inspect_engine(http):
++    value, _ = http.call("/token_kv_snapshot", {"operation": "inspect"})
++    require(value.get("status") == "PASS", "Unsupported engine")
++    identity = identity_from_inspect(value)
++    require(
++        type(identity.get("tp_size")) is int and identity["tp_size"] > 0,
++        "Missing native TP size",
++    )
++    rank_rows(value, identity["tp_size"])
++    return value, identity
++
++
++def checked_manifest(reference):
++    require(isinstance(reference, dict), "Missing committed manifest reference")
++    observed = file_ref(reference["path"])
++    require(observed == reference, "Committed manifest bytes/SHA differ")
++    return json.loads(Path(reference["path"]).read_text())
++
++
++def export_source(args):
++    http = HTTP(args.engine_url, args.out, args.timeout)
++    initial, identity = inspect_engine(http)
++    rid, snapshot_id = "source_" + uuid4().hex, "snapshot_" + uuid4().hex
++    prompt = args.prompt_file.read_text() if args.prompt_file else args.prompt
++    stream = SSE(
++        http,
++        {
++            "rid": rid,
++            "text": prompt,
++            "stream": True,
++            "return_logprob": True,
++            "logprob_start_len": -1,
++            "sampling_params": {
++                "temperature": args.temperature,
++                "max_new_tokens": args.max_new_tokens,
++            },
++        },
++        "source-generation",
++    )
++    stream.wait_tokens(args.interrupt_at)
++    require(not stream.done, "Source finished before interruption")
++    http.call("/pause_generation", {"mode": "in_place"})
++    guard = {
++        "identity": identity,
++        "expected_weight_version": identity["weight_version"],
++        "snapshot_id": snapshot_id,
++        "storage_dir": str(args.storage_dir),
++        "target_rid": rid,
++    }
++    exported, _ = http.call("/token_kv_snapshot", {**guard, "operation": "export"})
++    require(
++        exported.get("snapshot_committed") is True,
++        "All TP ranks must be committed before release",
++    )
++    checked_manifest(exported.get("manifest_ref"))
++    for row in rank_rows(exported, identity["tp_size"]).values():
++        require(
++            set(row.get("state_kinds", []))
++            == {"attention_kv", "mamba_conv", "mamba_temporal"},
++            "Incomplete hybrid state",
++        )
++    prefix = source_prefix(exported)
++    require(
++        len(prefix["token_ids"]) >= args.interrupt_at,
++        "Export has no interrupted token history",
++    )
++    released, _ = http.call(
++        "/token_kv_snapshot",
++        {**guard, "operation": "release", "release_full_gpu_pool": False},
++    )
++    for row in rank_rows(released, identity["tp_size"]).values():
++        require(
++            row.get("old_slots_released") is True and row.get("detached") is True,
++            "Source request still owns native slots",
++        )
++    result = {
++        "status": "CHECKPOINT_READY_SOURCE_LEFT_PAUSED",
++        "identity": identity,
++        "source_rid": rid,
++        "snapshot_id": snapshot_id,
++        "storage_dir": str(args.storage_dir),
++        "manifest_ref": exported["manifest_ref"],
++        "source_binding": exported.get("source_binding"),
++        "source_inspect": initial,
++        "export": exported,
++        "release": released,
++        "prefix": prefix,
++        "max_new_tokens": args.max_new_tokens,
++        "whole_gpu_returned": False,
++        "performance": "NOT_RUN",
++    }
++    write_json(args.out / "source-checkpoint.json", result)
++    return result
++
++
++def restore_target(args):
++    source = json.loads(args.source_receipt.read_text())
++    require(
++        source.get("status") == "CHECKPOINT_READY_SOURCE_LEFT_PAUSED",
++        "Source checkpoint did not finish",
++    )
++    checked_manifest(source.get("manifest_ref"))
++    http = HTTP(args.engine_url, args.out, args.timeout)
++    initial, identity = inspect_engine(http)
++    require(identity == source["identity"], "Source/target identity differs")
++    require(
++        initial.get("engine_instance_id")
++        and initial["engine_instance_id"]
++        != source["source_inspect"]["engine_instance_id"],
++        "Target must be a different engine instance",
++    )
++    rid = "target_" + uuid4().hex
++    descriptor = {
++        key: source[key]
++        for key in ("snapshot_id", "storage_dir", "manifest_ref", "source_binding")
++    }
++    descriptor.update(
++        identity=identity, expected_weight_version=identity["weight_version"]
++    )
++    stream = SSE(
++        http,
++        {"rid": rid, "stream": True, "token_kv_restore": descriptor},
++        "target-generation",
++    )
++    last = stream.finish()
++    output = token_output(last["raw"])
++    prefix = source["prefix"]
++    count = len(prefix["token_ids"])
++    require(
++        output["token_ids"][:count] == prefix["token_ids"]
++        and output["logprobs"][:count] == prefix["logprobs"],
++        "Previously generated tokens or logprobs changed",
++    )
++    require(
++        count < len(output["token_ids"]) <= source["max_new_tokens"]
++        and output["stop_reason"] not in (None, "abort", "aborted"),
++        "Native continuation did not complete within its saved budget",
++    )
++    require(
++        output["weight_version"] == identity["weight_version"],
++        "Native output version is absent or differs",
++    )
++    inspected, after_identity = inspect_engine(http)
++    require(after_identity == identity, "Target version changed during restore")
++    source_rows = rank_rows(source["export"], identity["tp_size"])
++    observed = []
++    for rank, row in rank_rows(inspected, identity["tp_size"]).items():
++        restored = row.get("portable_restore_by_rid", {}).get(rid)
++        require(isinstance(restored, dict), "Missing actual native import receipt")
++        require(
++            restored.get("request_reconstructed") is True
++            and restored.get("from_retained_cpu_record") is False
++            and restored.get("loaded_from_snapshot") is True
++            and restored.get("allocated_new_slots") is True
++            and restored.get("digestmatch") is True,
++            "Target did not reconstruct and read back the actual state",
++        )
++        for key in (
++            "state_sha256",
++            "state_inventory_sha256",
++            "state_bytes",
++            "computed_tokens",
++        ):
++            require(
++                restored.get(key) is not None
++                and restored[key] == source_rows[rank].get(key),
++                "Restored state differs from its source TP partition",
++            )
++        metrics = row.get("resume_metrics_by_rid", {}).get(rid)
++        require(
++            isinstance(metrics, dict)
++            and metrics.get("actual_input_counter_status")
++            == "OBSERVED_COMPLETED_NATIVE_FORWARD"
++            and metrics.get("actual_completed_forward_iters")
++            and type(metrics.get("actual_processed_input_tokens")) is int
++            and metrics["actual_processed_input_tokens"] > 0,
++            "No completed native forward input observation",
++        )
++        require(
++            metrics.get("actual_recomputed_tokens") == 0,
++            "Native forward recomputed part of the committed prefix",
++        )
++        observed.append({"tp_rank": rank, "restore": restored, "metrics": metrics})
++    require(
++        len(
++            {
++                (
++                    x["metrics"]["committed_prefix_tokens"],
++                    x["metrics"]["actual_recomputed_tokens"],
++                    x["metrics"]["actual_processed_input_tokens"],
++                )
++                for x in observed
++            }
++        )
++        == 1,
++        "TP ranks disagree on processed history",
++    )
++    result = {
++        "status": "PASS",
++        "scope": "FRESH_INSTANCE_NATIVE_REQUEST_RESTORE",
++        "source_receipt": file_ref(args.source_receipt),
++        "initial_inspect": initial,
++        "target_inspect": inspected,
++        "target_rid": rid,
++        "output": output,
++        "ranks": observed,
++        "actual_recomputed_history_tokens_per_rank": observed[0]["metrics"][
++            "actual_recomputed_tokens"
++        ],
++        "source_process_exit_verified": False,
++        "whole_gpu_returned": False,
++        "performance": "NOT_RUN",
++    }
++    write_json(args.out / "restore-result.json", result)
++    return result
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    sub = parser.add_subparsers(dest="phase", required=True)
++    export = sub.add_parser("export")
++    restore = sub.add_parser("resume")
++    for command in (export, restore):
++        command.add_argument("--engine-url", required=True)
++        command.add_argument("--out", type=Path, required=True)
++        command.add_argument("--timeout", type=float, default=180)
++    export.add_argument(
++        "--prompt", default="Describe the integers from one to one hundred in order."
++    )
++    export.add_argument("--prompt-file", type=Path)
++    export.add_argument("--storage-dir", type=Path, required=True)
++    export.add_argument("--interrupt-at", type=int, default=8)
++    export.add_argument("--max-new-tokens", type=int, default=128)
++    export.add_argument("--temperature", type=float, default=0.7)
++    restore.add_argument("--source-receipt", type=Path, required=True)
++    args = parser.parse_args()
++    require(math.isfinite(args.timeout) and args.timeout > 0, "Invalid timeout")
++    if args.phase == "export":
++        require(
++            0 < args.interrupt_at < args.max_new_tokens,
++            "Interruption must leave some original generation budget",
++        )
++        require(
++            args.storage_dir.is_absolute(),
++            "Storage path must be absolute on all servers",
++        )
++    args.out.mkdir(parents=True, exist_ok=False)
++    try:
++        result = export_source(args) if args.phase == "export" else restore_target(args)
++    except Exception as error:
++        write_json(
++            args.out / "failure.json",
++            {
++                "status": "FAILED",
++                "type": type(error).__name__,
++                "error": str(error),
++                "performance": "NOT_RUN",
++            },
++        )
++        raise
++    print(json.dumps({"status": result["status"], "evidence": str(args.out)}))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/examples/runtime/token_kv_restore_README.md b/examples/runtime/token_kv_restore_README.md
+new file mode 100644
+index 0000000000..82a2c76b3d
+--- /dev/null
++++ b/examples/runtime/token_kv_restore_README.md
+@@ -0,0 +1,122 @@
++# Resume an active hybrid request in a fresh process
++
++This opt-in example preserves an active request's Attention KV, Mamba conv and
++temporal state, generated token IDs, selected-token logprobs, and stream progress.
++The target imports the committed state into newly allocated native slots instead
++of prefilling the saved history again.
++
++## Supported scope
++
++Use identical model weights, weight version, source build, TP size, dtype, page
++size, and layer geometry. The GPU qualification used Qwen3.5-35B-A3B, TP2, on the
++same two A100 80GB devices, sequentially. The target may have a different local
++cache capacity; the request's state geometry must remain compatible and its
++allocations must fit. All TP ranks must have committed payloads before release.
++
++Snapshot files and the HTTP control endpoint must be trusted. The snapshot
++path must be visible at the same absolute path to both engines. This is not
++cross-host recovery, weight-switch preservation, crash-atomic storage, or an HA
++service. Sampling parameters and token history are retained; exact sampled-RNG
++trajectory equivalence is not established. The measured reference uses greedy
++generation. Do not edit a snapshot's identity to bypass a rejection.
++
++## Prepare a public input
++
++From the patched checkout, install SGLang's declared dependencies. Set MODEL to
++a local model path or an available public model identifier. This sample input
++is public and is not the private prompt used for the recorded GPU qualification.
++
++```bash
++export MODEL=Qwen/Qwen3.5-35B-A3B
++export RESULT="$PWD/token-kv-example-result"
++export SHARED_SNAPSHOT_DIR="$RESULT/snapshots"
++export PROMPT="$RESULT/prompt.txt"
++export SOURCE_URL=http://127.0.0.1:30000
++export TARGET_URL=http://127.0.0.1:30000
++mkdir -p "$SHARED_SNAPSHOT_DIR"
++cat > "$PROMPT" <<'PROMPT_EOF'
++Explain how plants convert sunlight into chemical energy. Describe the main
++stages in detail, including what happens in the light-dependent reactions and
++the Calvin cycle. Write a connected explanation of approximately 300 words.
++PROMPT_EOF
++```
++
++## Source: reference, committed export, then exit
++
++Start the source in its own terminal. The GPU pair must be available to this
++example. Preserve radix caching and overlap; do not enable speculative decoding,
++PD, PP, CP, DP, ReplaySSM, or additional unsupported side-state pools.
++
++```bash
++SGLANG_ENABLE_TOKEN_KV_SNAPSHOT=1 CUDA_VISIBLE_DEVICES=0,1 \
++  python -m sglang.launch_server --model-path "$MODEL" --tp-size 2 \
++  --mem-fraction-static 0.60 --weight-version snapshot-example-v1 --port 30000
++```
++
++After the engine is ready, run the public clients in another terminal:
++
++```bash
++python examples/runtime/token_kv_restore_reference.py capture \
++  --public-helper examples/runtime/token_kv_restore.py \
++  --engine-url "$SOURCE_URL" --prompt-file "$PROMPT" --max-new-tokens 128 \
++  --out "$RESULT/reference" --timeout 300
++python examples/runtime/token_kv_restore.py export \
++  --engine-url "$SOURCE_URL" --prompt-file "$PROMPT" \
++  --storage-dir "$SHARED_SNAPSHOT_DIR" --interrupt-at 8 --max-new-tokens 128 \
++  --temperature 0 --out "$RESULT/source" --timeout 300
++```
++
++Require all TP ranks COMMITTED, retained output history, and successful source
++private-slot release receipts. The CLI leaves the source paused; it does not
++start or stop engines. Stop only this owned source using its own terminal or
++process supervisor, and verify its GPU processes have exited before starting
++the target. Slot release alone is not proof that an entire GPU is free.
++
++## Target: new process, resume, compare
++
++Start a fresh target on the same devices and build. Keep every compatibility
++setting unchanged except the local memory fraction:
++
++```bash
++SGLANG_ENABLE_TOKEN_KV_SNAPSHOT=1 CUDA_VISIBLE_DEVICES=0,1 \
++  python -m sglang.launch_server --model-path "$MODEL" --tp-size 2 \
++  --mem-fraction-static 0.65 --weight-version snapshot-example-v1 --port 30000
++```
++
++Once the new engine is ready:
++
++```bash
++python examples/runtime/token_kv_restore.py resume \
++  --source-receipt "$RESULT/source/source-checkpoint.json" \
++  --engine-url "$TARGET_URL" --out "$RESULT/target" --timeout 300
++python examples/runtime/token_kv_restore_reference.py compare \
++  --public-helper examples/runtime/token_kv_restore.py \
++  --reference "$RESULT/reference/reference.json" \
++  --source-receipt "$RESULT/source/source-checkpoint.json" \
++  --restore-result "$RESULT/target/restore-result.json" --out "$RESULT/comparison"
++```
++
++Inspect `correctness.json`, the restore result, and both ranks' completed-forward
++observations. Require exact token IDs and logprobs, complete TP coverage, actual
++new allocations, matching state digests, and zero recomputation of committed
++history. Missing observations are unknown, not zero. Compare each rank's actual
++local capacity rather than inferring capacity from the requested flags. Do not
++sum replicated TP history counts or claim the whole workload had no prefill.
++Stop the owned target after checking results.
++
++## CPU checks
++
++The two registered test files exercise immutable storage, incomplete/corrupt
++records, compatibility rejection, native request reconstruction, batch updates,
++and completed-forward accounting without loading a model:
++
++```bash
++CUDA_VISIBLE_DEVICES='' PYTHONPATH=python   python test/registered/unit/mem_cache/test_token_kv_snapshot_store.py
++CUDA_VISIBLE_DEVICES='' PYTHONPATH=python   python test/registered/unit/managers/test_token_kv_snapshot.py
++```
++
++Use a prepared Linux SGLang environment for full module imports. A macOS
++installation without Triton cannot run those complete import paths. Historical
++GPU validation is tied to its recorded source revision; these parameterized
++commands and the public input have not been independently GPU-qualified on the
++refreshed PR base.
+diff --git a/examples/runtime/token_kv_restore_negative.py b/examples/runtime/token_kv_restore_negative.py
+new file mode 100644
+index 0000000000..31c9ae197b
+--- /dev/null
++++ b/examples/runtime/token_kv_restore_negative.py
+@@ -0,0 +1,480 @@
++from __future__ import annotations
++
++import argparse
++import copy
++import json
++import time
++import urllib.error
++import urllib.request
++import uuid
++from pathlib import Path
++
++from token_kv_restore import (
++    HTTP,
++    checked_manifest,
++    inspect_engine,
++    rank_rows,
++    require,
++    write_json,
++)
++
++EXPECTED = [
++    (
++        "invalid_weight_version",
++        "Descriptor weight version differs from snapshot identity",
++    ),
++    ("invalid_cache_layout", "model/version/cache layout identity mismatch"),
++    ("invalid_source_binding", "Snapshot trajectory/source binding differs"),
++    (
++        "invalid_manifest_ref",
++        "Descriptor manifest reference differs from committed snapshot",
++    ),
++]
++
++
++def _ranks(identity: dict) -> int:
++    for key in ("tensor_parallel_size", "tp_size", "world_size"):
++        value = identity.get(key)
++        if isinstance(value, int):
++            return value
++    raise ValueError("inspect identity does not expose tensor-parallel rank count")
++
++
++def _descriptor(receipt: dict) -> dict:
++    identity = copy.deepcopy(receipt["identity"])
++    descriptor = {
++        "snapshot_id": receipt["snapshot_id"],
++        "storage_dir": receipt["storage_dir"],
++        "manifest_ref": copy.deepcopy(receipt["manifest_ref"]),
++        "source_binding": copy.deepcopy(receipt["source_binding"]),
++        "identity": identity,
++        "expected_weight_version": identity["weight_version"],
++    }
++    return descriptor
++
++
++def _different_sha256(value: str) -> str:
++    require(
++        isinstance(value, str) and len(value) == 64,
++        "manifest_ref.sha256 must be 64 hex characters",
++    )
++    int(value, 16)
++    replacement = "0" if value[0] != "0" else "1"
++    return replacement + value[1:]
++
++
++def _read_body(response, deadline: float) -> bytes:
++    chunks, size = [], 0
++    while size < 65537:
++        if response.isclosed():
++            break
++        remaining = deadline - time.monotonic()
++        if remaining <= 0:
++            raise TimeoutError("negative response deadline reached")
++        owner = response
++        for _ in range(4):
++            sock = getattr(getattr(owner, "raw", None), "_sock", None)
++            if sock is not None:
++                sock.settimeout(remaining)
++                break
++            owner = getattr(owner, "fp", None)
++        else:
++            raise RuntimeError("cannot bind the response socket to its deadline")
++        chunk = response.read1(min(4096, 65537 - size))
++        if not chunk:
++            break
++        chunks.append(chunk)
++        size += len(chunk)
++    return b"".join(chunks)
++
++
++def _bounded_post(
++    engine_url: str, payload: dict, timeout: float
++) -> tuple[int, str, str, str, float]:
++    data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
++    request = urllib.request.Request(
++        engine_url.rstrip("/") + "/generate",
++        data=data,
++        headers={"Content-Type": "application/json"},
++        method="POST",
++    )
++    started = time.monotonic()
++    try:
++        with urllib.request.urlopen(request, timeout=timeout) as response:
++            status = response.status
++            content_type = response.headers.get("Content-Type", "")
++            raw = _read_body(response, started + timeout)
++    except urllib.error.HTTPError as error:
++        status = error.code
++        content_type = error.headers.get("Content-Type", "") if error.headers else ""
++        with error:
++            raw = _read_body(error, started + timeout)
++    body = raw[:65536].decode("utf-8", errors="replace")
++    return (
++        status,
++        content_type,
++        body,
++        "TRUNCATED" if len(raw) > 65536 else "COMPLETE",
++        time.monotonic() - started,
++    )
++
++
++def _records(body: str, content_type: str) -> list[dict]:
++    records: list[dict] = []
++    if "application/json" in content_type.lower() or (body.lstrip()[:1] in "{["):
++        records.append(json.loads(body))
++        return records
++    for line in body.splitlines():
++        line = line.strip()
++        if line.startswith("data:"):
++            item = line[5:].strip()
++            if item and item != "[DONE]":
++                records.append(json.loads(item))
++    require(records, "response contained neither JSON nor SSE data records")
++    return records
++
++
++def _error_text(records: list[dict]) -> str:
++    texts: list[str] = []
++
++    def visit(value: object) -> None:
++        if isinstance(value, dict):
++            for key, child in value.items():
++                if key in ("error", "message") and isinstance(child, str):
++                    texts.append(child)
++                visit(child)
++        elif isinstance(value, list):
++            for child in value:
++                visit(child)
++
++    visit(records)
++    return "\n".join(texts)
++
++
++def _has_generation(records: list[dict]) -> bool:
++    for record in records:
++        for key in ("token_ids", "output_ids", "text", "output_token_logprobs"):
++            if record.get(key):
++                return True
++        nested = [v for v in record.values() if isinstance(v, dict)]
++        if nested and _has_generation(nested):
++            return True
++    return False
++
++
++def _rank_evidence(raw_inspect: object) -> tuple[str, list[str]]:
++    rows = rank_rows(raw_inspect, 2)
++    if any(
++        not isinstance(row.get(field), dict)
++        for row in rows.values()
++        for field in ("portable_restore_by_rid", "resume_metrics_by_rid")
++    ):
++        return "UNKNOWN", []
++    return "PRESENT", [
++        str(row[field])
++        for row in rows.values()
++        for field in ("portable_restore_by_rid", "resume_metrics_by_rid")
++    ]
++
++
++def _validate_engine_role(
++    receipt: dict, raw_inspect: dict, identity: dict, role: str
++) -> None:
++    source_instance = receipt["source_inspect"]["engine_instance_id"]
++    current_instance = raw_inspect.get("engine_instance_id")
++    require(
++        isinstance(source_instance, str) and isinstance(current_instance, str),
++        "engine instance identity missing",
++    )
++    if role == "target":
++        require(
++            source_instance != current_instance,
++            "source and target engine instances must be distinct",
++        )
++        return
++    require(role == "released-source", "unknown explicit engine role")
++    require(
++        source_instance == current_instance,
++        "released-source must be the original engine instance",
++    )
++    release = receipt["release"]
++    require(
++        release.get("operation") == "release"
++        and release.get("snapshot_id") == receipt["snapshot_id"],
++        "release differs from the exported snapshot",
++    )
++    require(
++        release.get("identity") == identity
++        and receipt["export"].get("snapshot_committed") is True,
++        "released source identity or export commit differs",
++    )
++    exported = rank_rows(receipt["export"], 2)
++    for rank, row in rank_rows(release, 2).items():
++        require(
++            row.get("rid") == receipt["source_rid"]
++            and row.get("old_slots_released") is True
++            and row.get("detached") is True,
++            "all original TP request slots must be released and detached",
++        )
++        require(row.get("identity") == identity, "release rank identity differs")
++        for key in (
++            "state_sha256",
++            "state_inventory_sha256",
++            "computed_tokens",
++            "state_bytes",
++        ):
++            require(
++                row.get(key) is not None and row[key] == exported[rank].get(key),
++                "release rank differs from exported state",
++            )
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser(
++        description="HTTP-negative correctness entry for SGLang portable snapshot restore"
++    )
++    parser.add_argument("--engine-url", required=True)
++    parser.add_argument("--source-receipt", required=True, type=Path)
++    parser.add_argument(
++        "--engine-role", choices=("target", "released-source"), default="target"
++    )
++    parser.add_argument("--out", required=True, type=Path)
++    parser.add_argument("--timeout", type=float, default=30)
++    parser.add_argument("--total-timeout", type=float, default=150)
++    args = parser.parse_args()
++    require(0 < args.timeout <= 30, "--timeout must be in (0, 30]")
++    require(0 < args.total_timeout <= 180, "--total-timeout must be in (0, 180]")
++    args.out.mkdir(parents=True, exist_ok=False)
++
++    try:
++        receipt = json.loads(args.source_receipt.read_text(encoding="utf-8"))
++        require(
++            receipt.get("status") == "CHECKPOINT_READY_SOURCE_LEFT_PAUSED",
++            "source receipt status mismatch",
++        )
++        checked_manifest(receipt["manifest_ref"])
++
++        deadline = time.monotonic() + args.total_timeout
++        http = HTTP(args.engine_url, args.out, args.timeout)
++        raw_inspect, identity = inspect_engine(http)
++        require(
++            identity == receipt["identity"],
++            "target identity differs from source identity",
++        )
++        require(_ranks(identity) == 2, "actual inspect identity is not TP2")
++        source_instance = receipt["source_inspect"]["engine_instance_id"]
++        target_instance = raw_inspect.get("engine_instance_id")
++        require(
++            isinstance(source_instance, str) and isinstance(target_instance, str),
++            "engine instance identity missing",
++        )
++        _validate_engine_role(receipt, raw_inspect, identity, args.engine_role)
++
++        initial_observation, initial_native = _rank_evidence(raw_inspect)
++        results = []
++        passed = 0
++        for index, (name, expected_cause) in enumerate(EXPECTED):
++            descriptor = _descriptor(receipt)
++            if index == 0:
++                descriptor["expected_weight_version"] = (
++                    str(descriptor["expected_weight_version"]) + "_NEGATIVE"
++                )
++            elif index == 1:
++                require(
++                    isinstance(descriptor["identity"].get("cache_layout"), dict),
++                    "cache_layout must be a dict",
++                )
++                descriptor["identity"]["cache_layout"]["_negative_probe"] = True
++            elif index == 2:
++                require(
++                    descriptor["source_binding"] is None
++                    or isinstance(descriptor["source_binding"], dict),
++                    "source_binding must be null or a dict",
++                )
++                descriptor["source_binding"] = {
++                    **(descriptor["source_binding"] or {}),
++                    "_negative_probe": True,
++                }
++            else:
++                descriptor["manifest_ref"]["sha256"] = _different_sha256(
++                    descriptor["manifest_ref"]["sha256"]
++                )
++            payload = {
++                "rid": str(uuid.uuid4()),
++                "stream": True,
++                "token_kv_restore": descriptor,
++            }
++            remaining = deadline - time.monotonic()
++            if remaining <= 0:
++                result = {
++                    "arm": name,
++                    "outcome": "INCOMPLETE",
++                    "reason": "total timeout exhausted before POST",
++                }
++                results.append(result)
++                break
++            try:
++                status, content_type, body, read_state, elapsed = _bounded_post(
++                    args.engine_url, payload, min(args.timeout, remaining)
++                )
++            except Exception as error:
++                results.append(
++                    {
++                        "arm": name,
++                        "outcome": "INCOMPLETE",
++                        "reason": f"{type(error).__name__}: {error}",
++                        "payload": payload,
++                    }
++                )
++                break
++            write_json(
++                args.out / f"{index + 1:02d}-{name}.json",
++                dict(
++                    payload=payload,
++                    status=status,
++                    content_type=content_type,
++                    body=body,
++                    read_state=read_state,
++                    elapsed_s=elapsed,
++                    expected_cause=expected_cause,
++                ),
++            )
++            try:
++                records = _records(body, content_type)
++                error_text = _error_text(records)
++                rejected = expected_cause in error_text
++                generated = _has_generation(records)
++                require(read_state == "COMPLETE", f"truncated response in {name}")
++                require(
++                    any(
++                        isinstance(r, dict)
++                        and (r.get("error") or r.get("object") == "error")
++                        for r in records
++                    ),
++                    f"response has no structured error in {name}",
++                )
++                require(not generated, f"unexpected generated token content in {name}")
++                require(rejected, f"expected rejection cause absent in {name}")
++                outcome = "PASS_HTTP_REJECTION"
++                passed += 1
++            except Exception as error:
++                results.append(
++                    {
++                        "arm": name,
++                        "outcome": "FAIL",
++                        "reason": f"{type(error).__name__}: {error}",
++                        "status": status,
++                        "content_type": content_type,
++                        "body": body,
++                        "read_state": read_state,
++                        "elapsed": elapsed,
++                        "expected_cause": expected_cause,
++                        "payload": payload,
++                    }
++                )
++                break
++            results.append(
++                {
++                    "arm": name,
++                    "outcome": outcome,
++                    "status": status,
++                    "content_type": content_type,
++                    "body": body,
++                    "read_state": read_state,
++                    "elapsed": elapsed,
++                    "expected_cause": expected_cause,
++                    "payload": payload,
++                }
++            )
++
++        if passed == len(EXPECTED):
++            try:
++                require(
++                    time.monotonic() < deadline,
++                    "total deadline reached before final inspect",
++                )
++                http.timeout = min(args.timeout, deadline - time.monotonic())
++                final_raw, final_identity = inspect_engine(http)
++                require(
++                    final_identity == identity,
++                    "final inspect identity differs from initial identity",
++                )
++                evidence_state, evidence = _rank_evidence(final_raw)
++                invalid_rids = (
++                    [
++                        record["payload"]["rid"]
++                        for record in results
++                        if str(evidence).find(record["payload"]["rid"]) >= 0
++                    ]
++                    if evidence_state == "PRESENT"
++                    else []
++                )
++                require(
++                    not invalid_rids,
++                    f"invalid RID appeared in rank evidence: {invalid_rids}",
++                )
++                require(
++                    initial_observation == "PRESENT" and evidence_state == "PRESENT",
++                    "initial/final native evidence is missing",
++                )
++                require(
++                    evidence == initial_native,
++                    "native restore/input-counter observations changed during incompatible requests",
++                )
++                final = {
++                    "status": "PASS_HTTP_REJECTIONS_ONLY"
++                    if passed == len(EXPECTED)
++                    else "INCOMPLETE",
++                    "rejection_proofs": f"{passed}/{len(EXPECTED)}",
++                    "native_import_observation": evidence_state,
++                    "corrupt_disk_HTTP": "NOT_RUN",
++                    "valid_restore": "NOT_RUN_BY_THIS_ENTRY",
++                    "final_identity_fresh": final_identity == identity,
++                    "engine_role": args.engine_role,
++                    "native_observations_unchanged": evidence == initial_native,
++                    "engine_instance_id": target_instance,
++                    "arms": results,
++                }
++            except Exception as error:
++                final = {
++                    "status": "INCOMPLETE",
++                    "reason": f"final inspect failed: {type(error).__name__}: {error}",
++                    "arms": results,
++                }
++        else:
++            final = {
++                "status": "INCOMPLETE"
++                if all(r["outcome"] != "FAIL" for r in results)
++                else "FAIL",
++                "rejection_proofs": f"{passed}/{len(EXPECTED)}",
++                "corrupt_disk_HTTP": "NOT_RUN",
++                "valid_restore": "NOT_RUN_BY_THIS_ENTRY",
++                "arms": results,
++            }
++        write_json(args.out / "result.json", final)
++        print(
++            json.dumps(
++                {
++                    "status": final["status"],
++                    "rejection_proofs": final.get("rejection_proofs"),
++                    "native_import_observation": final.get("native_import_observation"),
++                },
++                ensure_ascii=True,
++                separators=(",", ":"),
++            )
++        )
++        return 0 if final["status"] == "PASS_HTTP_REJECTIONS_ONLY" else 1
++    except Exception as error:
++        final = {
++            "status": "INCOMPLETE",
++            "reason": f"{type(error).__name__}: {error}",
++            "corrupt_disk_HTTP": "NOT_RUN",
++            "valid_restore": "NOT_RUN_BY_THIS_ENTRY",
++        }
++        write_json(args.out / "result.json", final)
++        print(json.dumps(final))
++        return 1
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/examples/runtime/token_kv_restore_reference.py b/examples/runtime/token_kv_restore_reference.py
+new file mode 100644
+index 0000000000..11f7debaa0
+--- /dev/null
++++ b/examples/runtime/token_kv_restore_reference.py
+@@ -0,0 +1,127 @@
++"""One greedy reference on the source, then compare the original restored run.
++
++No engine lifecycle, retry or performance assertion. Uses the frozen public
++helper for actual HTTP, output-token and weight-version validation.
++"""
++
++import argparse
++import importlib.util
++import json
++import time
++from pathlib import Path
++
++
++def main():
++    p = argparse.ArgumentParser(description=__doc__)
++    p.add_argument("phase", choices=("capture", "compare"))
++    p.add_argument("--public-helper", type=Path, required=True)
++    p.add_argument("--out", type=Path, required=True)
++    p.add_argument("--engine-url")
++    p.add_argument("--prompt-file", type=Path)
++    p.add_argument("--max-new-tokens", type=int, default=128)
++    p.add_argument("--timeout", type=float, default=180)
++    p.add_argument("--reference", type=Path)
++    p.add_argument("--source-receipt", type=Path)
++    p.add_argument("--restore-result", type=Path)
++    a = p.parse_args()
++    spec = importlib.util.spec_from_file_location(
++        "frozen_public_restore", a.public_helper
++    )
++    helper = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(helper)
++    a.out.mkdir(parents=True, exist_ok=False)
++    if a.phase == "capture":
++        helper.require(
++            a.engine_url and a.prompt_file, "Reference needs actual source and prompt"
++        )
++        http = helper.HTTP(a.engine_url, a.out, a.timeout)
++        _, identity = helper.inspect_engine(http)
++        prompt = a.prompt_file.read_text()
++        request = dict(
++            text=prompt,
++            stream=True,
++            return_logprob=True,
++            logprob_start_len=-1,
++            sampling_params=dict(temperature=0, max_new_tokens=a.max_new_tokens),
++        )
++        stream = helper.SSE(http, request, "uninterrupted-reference")
++        output = helper.token_output(stream.finish()["raw"])
++        _, after = helper.inspect_engine(http)
++        helper.require(
++            after == identity
++            and output["weight_version"] == identity["weight_version"],
++            "Reference weights changed or output version missing",
++        )
++        helper.require(
++            output["stop_reason"] not in (None, "abort", "aborted")
++            and 8 < len(output["token_ids"]) <= a.max_new_tokens,
++            "Reference must finish and leave an active-interruption opportunity",
++        )
++        result = dict(
++            status="REFERENCE_OBSERVED",
++            identity=identity,
++            output=output,
++            prompt=helper.file_ref(a.prompt_file),
++            sampling_params=request["sampling_params"],
++            original_HTTP=http.refs,
++            captured_unix_s=time.time(),
++        )
++        helper.write_json(a.out / "reference.json", result)
++    else:
++        helper.require(
++            all((a.reference, a.source_receipt, a.restore_result)),
++            "Missing original results",
++        )
++        reference = json.loads(a.reference.read_text())
++        source = json.loads(a.source_receipt.read_text())
++        restored = json.loads(a.restore_result.read_text())
++        helper.require(
++            reference.get("status") == "REFERENCE_OBSERVED"
++            and restored.get("status") == "PASS"
++            and source.get("status") == "CHECKPOINT_READY_SOURCE_LEFT_PAUSED",
++            "Original reference/restore checks did not complete",
++        )
++        helper.require(
++            reference["sampling_params"]
++            == dict(temperature=0, max_new_tokens=source["max_new_tokens"]),
++            "Reference sampling/budget differs from the frozen export invocation",
++        )
++        helper.require(
++            reference["identity"] == source["identity"]
++            and reference["identity"] == restored["initial_inspect"]["identity"],
++            "Reference/source/target identity differs",
++        )
++        original = reference["output"]["token_ids"]
++        resumed = restored["output"]["token_ids"]
++        prefix = source["prefix"]["token_ids"]
++        helper.require(
++            prefix == original[: len(prefix)] and resumed == original,
++            "Greedy interrupted-prefix/continuation differs from uninterrupted reference",
++        )
++        helper.require(
++            restored["output"]["logprobs"] == reference["output"]["logprobs"],
++            "Greedy continuation logprobs differ from uninterrupted reference",
++        )
++        helper.require(
++            restored["output"]["stop_reason"] == reference["output"]["stop_reason"],
++            "Reference/restore completion reason differs",
++        )
++        result = dict(
++            status="PASS_GREEDY_REFERENCE_TOKEN_IDENTITY",
++            token_count=len(original),
++            interrupted_prefix_tokens=len(prefix),
++            prefix_equal=True,
++            continuation_equal=True,
++            logprob_count=len(reference["output"]["logprobs"]),
++            logprobs_equal=True,
++            source_reference=helper.file_ref(a.reference),
++            source_checkpoint=helper.file_ref(a.source_receipt),
++            target_restore=helper.file_ref(a.restore_result),
++            scope="This fixed prompt/greedy run only; not general numerical equivalence or a benchmark",
++        )
++        helper.write_json(a.out / "correctness.json", result)
++    print(json.dumps(dict(status=result["status"], output=str(a.out))))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
+index 430d86b9b6..5209e176e1 100644
+--- a/python/sglang/srt/entrypoints/http_server.py
++++ b/python/sglang/srt/entrypoints/http_server.py
+@@ -151,6 +151,7 @@ from sglang.srt.managers.io_struct import (
+     SeparateReasoningReqInput,
+     SetInternalStateReq,
+     SlowDownReqInput,
++    TokenKVSnapshotReqInput,
+     UnloadLoRAAdapterReqInput,
+     UpdateWeightFromDiskReqInput,
+     UpdateWeightsFromDistributedReqInput,
+@@ -1547,6 +1548,25 @@ async def get_weights_by_name(
+         return _create_error_response(e)
+ 
+ 
++@app.post("/token_kv_snapshot")
++@auth_level(AuthLevel.ADMIN_OPTIONAL)
++async def token_kv_snapshot(obj: Annotated[TokenKVSnapshotReqInput, Body()]):
++    """Persist and restore a settled same-version hybrid decode request."""
++    try:
++        result = await _global_state.tokenizer_manager.token_kv_snapshot(obj)
++        return ORJSONResponse(
++            result,
++            status_code=HTTPStatus.OK
++            if result["status"] == "PASS"
++            else HTTPStatus.CONFLICT,
++        )
++    except Exception as error:
++        return ORJSONResponse(
++            {"status": "FAILED", "error": str(error)},
++            status_code=HTTPStatus.CONFLICT,
++        )
++
++
+ @app.api_route("/release_memory_occupation", methods=["GET", "POST"])
+ @auth_level(AuthLevel.ADMIN_OPTIONAL)
+ async def release_memory_occupation(
+diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
+index 3148deb920..d9d63c4b4b 100644
+--- a/python/sglang/srt/managers/io_struct.py
++++ b/python/sglang/srt/managers/io_struct.py
+@@ -379,6 +379,9 @@ class GenerateReqInput:
+         Union[List[Optional[Union[Dict, KvHintsEnvelope]]], Dict, KvHintsEnvelope]
+     ] = None
+ 
++    # Opt-in restoration of one committed same-version native request.
++    token_kv_restore: Optional[Dict[str, Any]] = None
++
+     def regenerate_rid(self):
+         """Generate a new request ID and return it."""
+         if isinstance(self.rid, list):
+@@ -1178,6 +1181,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
+     # LoRA adapter name; KV events namespace this request's blocks by it.
+     lora_name: Optional[str] = None
+ 
++    # Opt-in restoration of one committed same-version native request.
++    token_kv_restore: Optional[Dict[str, Any]] = None
++
+     def wrap_pickle_fields(self):
+         self.time_stats = wrap_as_pickle(self.time_stats)
+ 
+@@ -2488,6 +2494,22 @@ class VertexGenerateReqInput(BaseReq, kw_only=True):
+     parameters: Optional[Dict[str, Any]] = None
+ 
+ 
++class TokenKVSnapshotReqInput(BaseReq, kw_only=True):
++    operation: str
++    snapshot_id: Optional[str] = None
++    target_rid: Optional[str] = None
++    storage_dir: Optional[str] = None
++    expected_weight_version: Optional[str] = None
++    identity: Optional[Dict[str, Any]] = None
++    release_full_gpu_pool: bool = False
++    source_binding: Optional[Dict[str, Any]] = None
++
++
++class TokenKVSnapshotReqOutput(BaseReq, kw_only=True):
++    success: bool
++    results: List[Dict[str, Any]]
++
++
+ class RpcReqInput(BaseReq, kw_only=True):
+     method: str
+     # collective_rpc kwargs are flat scalars across all in-tree callers.
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 966e823611..f4703ecacb 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -180,6 +180,7 @@ from sglang.srt.managers.io_struct import (
+     SlowDownReqOutput,
+     TokenizedEmbeddingReqInput,
+     TokenizedGenerateReqInput,
++    TokenKVSnapshotReqInput,
+     UnloadLoRAAdapterReqInput,
+     UnloadLoRAAdapterReqOutput,
+     UpdateWeightFromDiskReqInput,
+@@ -1852,6 +1853,7 @@ class Scheduler(
+                     self.weight_updater.check_weights,
+                 ),
+                 (SlowDownReqInput, self.slow_down),
++                (TokenKVSnapshotReqInput, self.handle_token_kv_snapshot),
+                 (PdRoleSwitchReqInput, self.handle_pd_role_switch),
+                 (
+                     ProfileReq,
+@@ -3260,6 +3262,26 @@ class Scheduler(
+             recv_req.pp_prefetch_ticketed = bool(self._prefetch_kvcache(req))
+             self.tree_cache.bind_prefetch_ticket(req.rid, recv_req.pp_prefetch_ticketed)
+ 
++        if os.environ.get("SGLANG_ENABLE_TOKEN_KV_SNAPSHOT") == "1" and not hasattr(
++            self, "token_kv_snapshot_manager"
++        ):
++            from sglang.srt.managers.token_kv_snapshot import TokenKVSnapshotManager
++
++            self.token_kv_snapshot_manager = TokenKVSnapshotManager(self)
++        if recv_req.token_kv_restore is not None:
++            if not hasattr(self, "token_kv_snapshot_manager"):
++                from sglang.srt.managers.token_kv_snapshot import TokenKVSnapshotManager
++
++                self.token_kv_snapshot_manager = TokenKVSnapshotManager(self)
++            try:
++                self.token_kv_snapshot_manager.import_for_generation(
++                    req, recv_req.token_kv_restore
++                )
++            except Exception as error:
++                prepare_abort(req, str(error), status_code=HTTPStatus.BAD_REQUEST)
++                self.output_streamer.stream_output([req], req.return_logprob)
++            return
++
+         added_to_grammar_queue = self.grammar_manager.process_req_with_grammar(req)
+         if not added_to_grammar_queue:
+             self._add_request_to_queue(req)
+@@ -4553,6 +4575,7 @@ class Scheduler(
+         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
+         """Run a batch."""
++        _tkv_intervals = None
+         self.metrics_reporter.record_scheduler_active(time.monotonic_ns())
+         self.forward_ct += 1
+         batch.forward_iter = self.forward_ct
+@@ -4634,6 +4657,11 @@ class Scheduler(
+                                 )
+ 
+                         # FIXME: pp is not compatible with overlap
++                        _tkv_manager = getattr(self, "token_kv_snapshot_manager", None)
++                        if _tkv_manager is not None:
++                            _tkv_intervals = (
++                                _tkv_manager.capture_native_input_intervals(batch)
++                            )
+                         batch_result = self.model_worker.forward_batch_generation(
+                             batch, **fwd_kwargs
+                         )
+@@ -4689,6 +4717,9 @@ class Scheduler(
+                     batch.spec_info.future_indices = future_indices
+             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
+                 resolve_forward_inputs(batch, self.future_map)
++                _tkv_manager = getattr(self, "token_kv_snapshot_manager", None)
++                if _tkv_manager is not None:
++                    _tkv_intervals = _tkv_manager.capture_native_input_intervals(batch)
+                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
+                 self._relay_forward_payload(batch, batch.req_pool_indices, batch_result)
+                 batch.input_ids = None
+@@ -4746,6 +4777,11 @@ class Scheduler(
+                             verify_forward_batch.out_cache_loc
+                         )
+                     else:
++                        _tkv_manager = getattr(self, "token_kv_snapshot_manager", None)
++                        if _tkv_manager is not None:
++                            _tkv_intervals = (
++                                _tkv_manager.capture_native_input_intervals(batch)
++                            )
+                         batch_result = self.model_worker.forward_batch_generation(
+                             batch, pp_proxy_tensors=pp_proxy_tensors
+                         )
+@@ -4759,6 +4795,11 @@ class Scheduler(
+                     # future_map relay / on_publish).
+                     resolve_forward_inputs(batch, self.future_map)
+                     with self._forward_isolation(batch, overlap=False):
++                        _tkv_manager = getattr(self, "token_kv_snapshot_manager", None)
++                        if _tkv_manager is not None:
++                            _tkv_intervals = (
++                                _tkv_manager.capture_native_input_intervals(batch)
++                            )
+                         batch_result = self.model_worker.forward_batch_generation(
+                             batch, pp_proxy_tensors=pp_proxy_tensors
+                         )
+@@ -4800,6 +4841,9 @@ class Scheduler(
+                     else {}
+                 )
+                 resolve_forward_inputs(batch, self.future_map)
++                _tkv_manager = getattr(self, "token_kv_snapshot_manager", None)
++                if _tkv_manager is not None:
++                    _tkv_intervals = _tkv_manager.capture_native_input_intervals(batch)
+                 batch_result = self.model_worker.forward_batch_generation(
+                     batch, **kwargs
+                 )
+@@ -4865,6 +4909,8 @@ class Scheduler(
+ 
+         self._maybe_report_active_ranks()
+ 
++        if _tkv_intervals is not None:
++            ret._token_kv_native_input_intervals = _tkv_intervals
+         return ret
+ 
+     def _maybe_report_active_ranks(self) -> None:
+@@ -5039,6 +5085,12 @@ class Scheduler(
+         self.tree_cache.flush_pending_backups()
+ 
+         self._record_step_counters(batch, result)
++        snapshot_manager = getattr(self, "token_kv_snapshot_manager", None)
++        if snapshot_manager is not None:
++            snapshot_manager.observe_native_input_intervals(
++                getattr(result, "_token_kv_native_input_intervals", None)
++            )
++            snapshot_manager.observe_batch_result(batch)
+ 
+         self.metrics_reporter.log_batch_result_stats(batch, result)
+ 
+@@ -5542,6 +5594,16 @@ class Scheduler(
+             inflight_batches.extend(batch for batch, _ in self.result_queue)
+         return inflight_batches
+ 
++    def handle_token_kv_snapshot(self, recv_req: TokenKVSnapshotReqInput):
++        from sglang.srt.managers.token_kv_snapshot import TokenKVSnapshotManager
++
++        manager = getattr(self, "token_kv_snapshot_manager", None)
++        if manager is None:
++            manager = TokenKVSnapshotManager(self)
++            if os.environ.get("SGLANG_ENABLE_TOKEN_KV_SNAPSHOT") == "1":
++                self.token_kv_snapshot_manager = manager
++        return manager.handle(recv_req)
++
+     def abort_request(self, recv_req: AbortReq):
+         if (chunked_req := self.chunked_req) is not None:
+             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
+@@ -5801,6 +5863,9 @@ class Scheduler(
+         self.kv_events_publisher.publish_kv_events()
+ 
+     def continue_generation(self, recv_req: ContinueGenerationReqInput):
++        snapshot_manager = getattr(self, "token_kv_snapshot_manager", None)
++        if snapshot_manager is not None and snapshot_manager.has_released_request:
++            raise ValueError("Cannot continue before released snapshot is restored")
+         if recv_req.torch_empty_cache:
+             before_mb = torch.cuda.memory_reserved() / (1024 * 1024)
+             torch.cuda.empty_cache()
+diff --git a/python/sglang/srt/managers/token_kv_snapshot.py b/python/sglang/srt/managers/token_kv_snapshot.py
+new file mode 100644
+index 0000000000..3c1b2e833d
+--- /dev/null
++++ b/python/sglang/srt/managers/token_kv_snapshot.py
+@@ -0,0 +1,1424 @@
++"""Opt-in same-version hybrid decode snapshots and native request reconstruction.
++
++Attention KV and GDN conv/temporal tensors are persisted with the actual token,
++sampling and output state. A fresh /generate stream can reconstruct a request
++without the source engine's CPU objects. Grammar, speculation and multimodal
++state are intentionally rejected rather than silently re-prefilled.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import io
++import json
++import os
++import socket
++import time
++from array import array
++from pathlib import Path
++from types import SimpleNamespace
++
++import msgspec
++import torch
++
++from sglang.srt.managers.io_struct import (
++    AbortReq,
++    ReleaseMemoryOccupationReqInput,
++    ResumeMemoryOccupationReqInput,
++    TokenKVSnapshotReqOutput,
++)
++from sglang.srt.managers.overlap_utils import RelayPayload
++from sglang.srt.managers.schedule_batch import ScheduleBatch
++from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
++from sglang.srt.mem_cache.common import release_kv_cache
++from sglang.srt.mem_cache.token_kv_snapshot_store import TokenKVSnapshotStore
++from sglang.srt.model_executor.forward_batch_info import ForwardMode
++from sglang.srt.runtime_context import get_parallel, get_serving
++from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
++from sglang.srt.sampling.sampling_params import SamplingParams
++
++
++def _json_digest(value):
++    return hashlib.sha256(
++        json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
++    ).hexdigest()
++
++
++def _resolved_sampling_params(params):
++    result = {}
++    for field in msgspec.structs.fields(params):
++        value = getattr(params, field.name)
++        if field.name == "custom_params" and value is not None:
++            value = {key: item for key, item in value.items() if key != "__req__"}
++        if isinstance(value, set):
++            value = sorted(value)
++        result[field.name] = value
++    # Refuse CPU callbacks or other objects that cannot survive engine exit.
++    return json.loads(json.dumps(result, sort_keys=True, allow_nan=False))
++
++
++def sampling_params_from_snapshot(values):
++    values = dict(values)
++    if values.get("stop_token_ids") is not None:
++        values["stop_token_ids"] = set(values["stop_token_ids"])
++    if not values.get("is_normalized"):
++        raise ValueError("Snapshot requires resolved, normalized sampling parameters")
++    return SamplingParams(**values)
++
++
++def _validate_portable_metadata(metadata, descriptor):
++    if metadata.get("request_schema_version") != 2:
++        raise ValueError("Snapshot has no portable request state")
++    inputs, outputs = metadata["origin_input_ids"], metadata["output_ids"]
++    if not inputs or not outputs or any(type(t) is not int for t in inputs + outputs):
++        raise ValueError("Snapshot token history is invalid")
++    if _json_digest(inputs) != metadata["origin_input_ids_sha256"]:
++        raise ValueError("Snapshot original input digest differs")
++    if metadata["computed_tokens"] != len(inputs) + len(outputs) - 1:
++        raise ValueError("Snapshot computed prefix is not aligned")
++    if metadata["pending_input_token"] != outputs[-1]:
++        raise ValueError("Snapshot pending decode token is not aligned")
++    params = sampling_params_from_snapshot(metadata["resolved_sampling_params"])
++    if getattr(params, "watermark", None) is not None:
++        raise ValueError("Portable restore does not support watermark state")
++    if (
++        metadata["request_flags"].get("sampling_logprobs_mode", "selected")
++        != "selected"
++    ):
++        raise ValueError("Portable restore supports selected-token logprobs only")
++    if (
++        params.n != 1
++        or (getattr(params, "beam_width", None) or 1) != 1
++        or any((params.json_schema, params.regex, params.ebnf, params.structural_tag))
++    ):
++        raise ValueError("Portable restore does not support beam, n>1 or grammar state")
++    if params.max_new_tokens - len(outputs) != metadata["remaining_generation_tokens"]:
++        raise ValueError("Snapshot remaining generation budget differs")
++    if metadata["remaining_generation_tokens"] <= 0:
++        raise ValueError("Snapshot has no remaining generation budget")
++    if descriptor.get("source_binding") != metadata.get("source_binding"):
++        raise ValueError("Snapshot trajectory/source binding differs")
++    flags = metadata["request_flags"]
++    if flags["return_logprob"] and (
++        len(metadata["output_logprobs"]) != len(outputs)
++        or metadata["output_logprob_token_ids"] != outputs
++    ):
++        raise ValueError("Snapshot output logprobs are not aligned with output IDs")
++    return params
++
++
++def prepare_portable_generate_input(obj):
++    """Populate a new native HTTP request only from committed disk material."""
++    if os.environ.get("SGLANG_ENABLE_TOKEN_KV_SNAPSHOT") != "1":
++        raise ValueError("SGLANG_ENABLE_TOKEN_KV_SNAPSHOT=1 is required")
++    if getattr(obj, "sampling_logprobs_mode", None) is not None:
++        raise ValueError(
++            "Portable restore does not accept an explicit sampling_logprobs_mode"
++        )
++    if (
++        getattr(obj, "watermark", None) is not None
++        or (getattr(obj, "sampling_logprobs_mode", None) or "selected") != "selected"
++        or getattr(obj, "kv_hints", None) is not None
++    ):
++        raise ValueError(
++            "Portable restore does not support watermark, alternate logprobs or KV hints"
++        )
++    descriptor = obj.token_kv_restore
++    identity = descriptor["identity"]
++    if descriptor["expected_weight_version"] != identity["weight_version"]:
++        raise ValueError("Descriptor weight version differs from snapshot identity")
++    store = TokenKVSnapshotStore(descriptor["storage_dir"])
++    commit = store.receipt(descriptor["snapshot_id"])
++    if (
++        descriptor.get("manifest_ref") is not None
++        and descriptor["manifest_ref"] != commit["manifest_ref"]
++    ):
++        raise ValueError(
++            "Descriptor manifest reference differs from committed snapshot"
++        )
++    rank, _ = store.read_rank(
++        descriptor["snapshot_id"],
++        tp_rank=0,
++        tp_size=identity["tp_size"],
++        expected_identity=identity,
++    )
++    metadata = rank["request_metadata"]
++    _validate_portable_metadata(metadata, descriptor)
++    if isinstance(obj.rid, list) or (
++        obj.rid is not None and obj.rid == metadata["rid"]
++    ):
++        raise ValueError("Portable restore requires a new single target request ID")
++    if not obj.stream:
++        raise ValueError(
++            "Portable restore requires a fresh streaming /generate request"
++        )
++    if (
++        obj.input_embeds is not None
++        or obj.contains_mm_input()
++        or obj.session_params
++        or obj.session_id
++        or obj.lora_path
++        or obj.lora_id
++        or obj.custom_logit_processor
++        or obj.positional_embed_overrides is not None
++        or obj.return_hidden_states
++        or obj.return_routed_experts
++        or obj.return_indexer_topk
++        or obj.return_sampling_mask
++    ):
++        raise ValueError("Portable restore accepts only a plain text decode request")
++    obj.text = None
++    obj.input_ids = metadata["origin_input_ids"]
++    obj.sampling_params = metadata["resolved_sampling_params"]
++    for name, value in metadata["request_flags"].items():
++        setattr(obj, name, value)
++    # The internal selected default is omitted at the public HTTP boundary.
++    if getattr(obj, "sampling_logprobs_mode", None) == "selected":
++        obj.sampling_logprobs_mode = None
++
++
++def _tensor_inventory(value, prefix=""):
++    result = []
++    if isinstance(value, torch.Tensor):
++        tensor = value.detach().cpu().contiguous()
++        raw = tensor.reshape(-1).view(torch.uint8).numpy().tobytes()
++        result.append(
++            {
++                "name": prefix,
++                "shape": list(tensor.shape),
++                "dtype": str(tensor.dtype),
++                "bytes": len(raw),
++                "sha256": hashlib.sha256(raw).hexdigest(),
++            }
++        )
++    elif isinstance(value, (list, tuple)):
++        for index, item in enumerate(value):
++            result.extend(_tensor_inventory(item, f"{prefix}.{index}"))
++    elif isinstance(value, dict):
++        for key in sorted(value):
++            result.extend(_tensor_inventory(value[key], f"{prefix}.{key}"))
++    elif value is not None:
++        raise ValueError(f"Unsupported tensor payload at {prefix}: {type(value)}")
++    return result
++
++
++def _state_receipt(payload):
++    inventory = _tensor_inventory(payload)
++    layout = [{k: v for k, v in item.items() if k != "sha256"} for item in inventory]
++    return {
++        "state_kinds": ["attention_kv", "mamba_conv", "mamba_temporal"],
++        "state_inventory": inventory,
++        "state_inventory_sha256": _json_digest(layout),
++        "state_sha256": _json_digest(inventory),
++        "state_bytes": sum(item["bytes"] for item in inventory),
++    }
++
++
++def _cuda_memory():
++    if not torch.cuda.is_available():
++        return None
++    free, total = torch.cuda.mem_get_info()
++    return {"free_bytes": free, "total_bytes": total}
++
++
++class TokenKVSnapshotManager:
++    def __init__(self, scheduler):
++        self.scheduler = scheduler
++        self.records = {}
++        self.resume_metrics = {}
++        self.portable_restore_by_rid = {}
++        self.engine_instance_id = f"{socket.gethostname()}:{os.getpid()}"
++
++    @property
++    def has_released_request(self):
++        # A detached source request no longer owns scheduler state. It must not
++        # block the engine while other requests continue decoding.
++        return any(
++            record["released"] and not record.get("detached", False)
++            for record in self.records.values()
++        )
++
++    def _cache_layout(self, *, request_scope=False):
++        scheduler = self.scheduler
++        pool = scheduler.req_to_token_pool.mamba_pool
++        config = scheduler.model_config.hf_config
++        config_dict = config.to_dict()
++        full_pool = getattr(scheduler.token_to_kv_pool_allocator, "_kvcache", None)
++        full_layer_ids = sorted(
++            getattr(full_pool, "full_attention_layer_id_mapping", {})
++        )
++
++        conv_layout = []
++        for tensor in pool.mamba_cache.conv:
++            shape = list(tensor.shape)
++            if len(shape) < 2:
++                raise ValueError("Mamba conv cache metadata has no slot axis")
++            if (
++                not isinstance(shape[1], int)
++                or isinstance(shape[1], bool)
++                or shape[1] <= 0
++            ):
++                raise ValueError(
++                    "Mamba conv cache slot dimension is not a positive integer"
++                )
++            if request_scope:
++                shape[1] = 1
++            conv_layout.append({"shape": shape, "dtype": str(tensor.dtype)})
++
++        temporal_shape = list(pool.mamba_cache.temporal.shape)
++        if len(temporal_shape) < 2:
++            raise ValueError("Mamba temporal cache metadata has no slot axis")
++        if (
++            not isinstance(temporal_shape[1], int)
++            or isinstance(temporal_shape[1], bool)
++            or temporal_shape[1] <= 0
++        ):
++            raise ValueError(
++                "Mamba temporal cache slot dimension is not a positive integer"
++            )
++        if request_scope:
++            temporal_shape[1] = 1
++
++        return {
++            "allocator": type(scheduler.token_to_kv_pool_allocator).__name__,
++            "request_pool": type(scheduler.req_to_token_pool).__name__,
++            "page_size": scheduler.token_to_kv_pool_allocator.page_size,
++            "full_attention_layer_ids": full_layer_ids,
++            "mamba_layer_ids": list(getattr(pool, "mamba_layer_ids", [])),
++            "conv": conv_layout,
++            "temporal": {
++                "shape": temporal_shape,
++                "dtype": str(pool.mamba_cache.temporal.dtype),
++            },
++        }
++
++    def _identity(self):
++        scheduler = self.scheduler
++        pool = scheduler.req_to_token_pool.mamba_pool
++        config = scheduler.model_config.hf_config
++        config_dict = config.to_dict()
++        text_config = config_dict.get("text_config", config_dict)
++        layout = self._cache_layout(request_scope=True)
++        source_files = [Path(__file__), Path(__file__).with_name("schedule_batch.py")]
++        source_digest = hashlib.sha256()
++        for source in source_files:
++            source_digest.update(source.name.encode())
++            source_digest.update(source.read_bytes())
++        version = get_serving().weight_version
++        config_file = Path(scheduler.server_args.model_path) / "config.json"
++        return {
++            "model_path": str(scheduler.server_args.model_path),
++            "model_revision": getattr(config, "_commit_hash", None),
++            "model_config_sha256": _json_digest(config_dict),
++            "actual_model_config_file_sha256": (
++                hashlib.sha256(config_file.read_bytes()).hexdigest()
++                if config_file.is_file()
++                else None
++            ),
++            "model_type": config_dict.get("model_type"),
++            "architectures": config_dict.get("architectures", []),
++            "text_model_type": text_config.get("model_type"),
++            "num_hidden_layers": text_config.get("num_hidden_layers"),
++            "layer_types": text_config.get("layer_types"),
++            "num_experts": text_config.get("num_experts"),
++            "linear_conv_kernel_dim": text_config.get("linear_conv_kernel_dim"),
++            "weight_version": version,
++            "actualweight_version": version,
++            "tp_size": get_parallel().tp_size,
++            "cache_layout_sha256": _json_digest(layout),
++            "engine_source_sha256": source_digest.hexdigest(),
++            "cache_layout": layout,
++        }
++
++    def _check_runtime(self):
++        scheduler = self.scheduler
++        failures = []
++        if os.environ.get("SGLANG_ENABLE_TOKEN_KV_SNAPSHOT") != "1":
++            failures.append("SGLANG_ENABLE_TOKEN_KV_SNAPSHOT=1 is required")
++        mode = scheduler.disaggregation_mode
++        if getattr(mode, "value", mode) not in (None, "null"):
++            failures.append("PD disaggregation is unsupported")
++        if (
++            get_parallel().pp_size != 1
++            or get_parallel().attn_cp_size != 1
++            or get_parallel().dcp_size != 1
++        ):
++            failures.append("PP and CP are unsupported")
++        if get_parallel().attn_dp_size != 1:
++            failures.append("DP is unsupported")
++        if not scheduler.spec_algorithm.is_none():
++            failures.append("speculative decoding is unsupported")
++        pool = getattr(scheduler.req_to_token_pool, "mamba_pool", None)
++        if pool is None:
++            failures.append("hybrid attention/GDN pools are required")
++        elif getattr(pool, "replayssm_write_pos", None) is not None:
++            failures.append("ReplaySSM must be disabled")
++        elif getattr(pool, "_slot_siblings", []):
++            failures.append("additional hybrid side-state pools are unsupported")
++        if get_serving().weight_version is None:
++            failures.append("a non-null engine weight_version is required")
++        return failures
++
++    def _validate_identity(self, request):
++        identity = self._identity()
++        if request.expected_weight_version != identity["weight_version"]:
++            raise ValueError(
++                "Engine weight version differs from expected_weight_version"
++            )
++        if request.identity != identity:
++            raise ValueError(
++                "Snapshot model/version/TP/layout identity differs from engine"
++            )
++        return identity
++
++    def _drain_overlap_results(self):
++        """Finish the native overlap result boundary before reading request state.
++
++        ``pause_generation(in_place)`` intentionally leaves the scheduler state
++        untouched. In overlap mode that can leave one completed forward in
++        ``result_queue``. Processing that result here reuses the scheduler's
++        normal synchronization and request-update path; it does not disable
++        overlap or launch another forward.
++        """
++        scheduler = self.scheduler
++        if not scheduler.enable_overlap:
++            return 0
++        result_queue = getattr(scheduler, "result_queue", None)
++        if result_queue is None:
++            return 0
++        drained = 0
++        while result_queue:
++            batch, result = result_queue.popleft()
++            scheduler.process_batch_result(batch, result)
++            drained += 1
++        # ``last_batch`` is the native overlap marker for a queued result. Once
++        # the queue is fully processed here, keep the scheduler's next iteration
++        # from treating a stale marker as another outstanding result.
++        scheduler.last_batch = None
++        return drained
++
++    def _request(self, request):
++        scheduler = self.scheduler
++        rid = request.target_rid or request.rid
++        batch = scheduler.running_batch
++        matches = [
++            (index, req) for index, req in enumerate(batch.reqs) if req.rid == rid
++        ]
++        if len(matches) != 1:
++            raise ValueError("Snapshot requires one active request matching rid")
++        index, req = matches[0]
++        if req.finished() or not req.output_ids:
++            raise ValueError("Request is finished or has no sampled output token")
++        if (
++            req.grammar is not None
++            or getattr(req, "beam_group", None) is not None
++            or req.multimodal_inputs is not None
++            or req.input_embeds is not None
++            or req.session is not None
++            or req.lora_id is not None
++            or req.custom_logit_processor is not None
++        ):
++            raise ValueError(
++                "Grammar, beam, multimodal, embeddings, sessions and LoRA are unsupported"
++            )
++        computed = req.kv.kv_committed_len
++        expected = len(req.origin_input_ids) + len(req.output_ids) - 1
++        if computed != expected or int(batch.seq_lens_cpu[index]) != computed:
++            raise ValueError(
++                "Computed prefix is not aligned with the pending last output token"
++            )
++        # Native non-overlap decode relays the sampled token through FutureMap
++        # and clears batch.input_ids. Reading the previous forward's input would
++        # either dereference None or check the token before the saved boundary.
++        pending = self.scheduler.future_map.output_tokens_buf[req.kv.req_pool_idx]
++        if int(pending) != req.output_ids[-1]:
++            raise ValueError("Decode input differs from pending last output token")
++        if not req.kv.holds_kv:
++            raise ValueError("Request has no active KV allocation")
++        if not 0 <= req.kv.cache_protected_len <= computed:
++            raise ValueError("Shared prefix length is outside the computed prefix")
++        if req.kv.kv_allocated_len != computed:
++            raise ValueError("Overallocated KV is unsupported")
++        return req, batch, computed, index
++
++    def _request_metadata(self, req, computed, source_binding=None):
++        if (
++            getattr(req.sampling_params, "watermark", None) is not None
++            or getattr(req, "sampling_logprobs_mode", "selected") != "selected"
++            or getattr(req, "return_flat_raw_top_logprobs", False)
++        ):
++            raise ValueError(
++                "Only non-watermarked selected-token logprobs are portable"
++            )
++        if (
++            req.return_sampling_mask
++            or req.return_hidden_states
++            or req.return_routed_experts
++            or req.return_indexer_topk
++            or req.logprob.top_logprobs_num
++            or req.logprob.token_ids_logprob
++            or (
++                req.return_logprob and req.logprob_start_len < len(req.origin_input_ids)
++            )
++        ):
++            raise ValueError("Only ordinary output-token logprobs are portable")
++        spans = getattr(req, "_token_kv_output_version_spans", [])
++        if not spans or spans[-1]["end"] != len(req.output_ids):
++            raise ValueError(
++                "Actual processed-output weight version coverage is missing"
++            )
++        if len(spans) != 1 or spans[0]["version"] != get_serving().weight_version:
++            raise ValueError(
++                "A request spanning multiple weight versions is unsupported"
++            )
++        output_logprobs = list(req.logprob.output_token_logprobs_val or [])
++        output_logprob_ids = list(req.logprob.output_token_logprobs_idx or [])
++        return {
++            "request_schema_version": 2,
++            "rid": req.rid,
++            "origin_input_ids": list(req.origin_input_ids),
++            "origin_input_ids_sha256": _json_digest(list(req.origin_input_ids)),
++            "resolved_sampling_params": _resolved_sampling_params(req.sampling_params),
++            "request_flags": {
++                "return_logprob": req.return_logprob,
++                "logprob_start_len": req.logprob_start_len,
++                "top_logprobs_num": req.logprob.top_logprobs_num,
++                "token_ids_logprob": req.logprob.token_ids_logprob,
++                "require_reasoning": req.require_reasoning,
++                "sampling_logprobs_mode": "selected",
++            },
++            "output_ids": list(req.output_ids),
++            "output_logprobs": output_logprobs,
++            "output_logprob_token_ids": output_logprob_ids,
++            "output_weight_versions": [dict(span) for span in spans],
++            "computed_tokens": computed,
++            "pending_input_token": int(req.output_ids[-1]),
++            "send_token_offset": req.send_token_offset,
++            "source_stream_cursors": {
++                "send_token_offset": req.send_token_offset,
++                "send_decode_id_offset": req.send_decode_id_offset,
++                "send_output_token_logprobs_offset": req.send_output_token_logprobs_offset,
++                "surr_offset": req.surr_offset,
++                "read_offset": req.read_offset,
++            },
++            "reasoning_state": {
++                "is_reasoning_over": req._is_reasoning_over,
++                "reasoning_tokens": req.reasoning_tokens,
++                "think_end_match_len": req._think_end_match_len,
++            },
++            "decode_batch_idx": req.decode_batch_idx,
++            "temp_scaled_logprobs": req.temp_scaled_logprobs,
++            "top_p_normalized_logprobs": req.top_p_normalized_logprobs,
++            "source_binding": source_binding,
++            "remaining_generation_tokens": req.sampling_params.max_new_tokens
++            - len(req.output_ids),
++            "sampling_state_recovery": "PORTABLE_NORMALIZED_PARAMS_AND_TOKEN_HISTORY",
++        }
++
++    def _copy(self, req, computed):
++        scheduler = self.scheduler
++        indices = scheduler.req_to_token_pool.req_to_token[
++            req.kv.req_pool_idx, :computed
++        ].long()
++        kv_cpu, mamba_cpu = scheduler.token_to_kv_pool_allocator.get_cpu_copy(
++            indices,
++            mamba_indices=req.kv.mamba_pool_idx,
++        )
++        if mamba_cpu is None or len(mamba_cpu) != 2:
++            raise ValueError("Expected ordinary GDN conv and temporal state")
++        return {
++            "attention_kv": kv_cpu,
++            "mamba_conv": mamba_cpu[0],
++            "mamba_temporal": mamba_cpu[1],
++        }
++
++    def _load(self, req, computed, payload):
++        scheduler = self.scheduler
++        indices = scheduler.req_to_token_pool.req_to_token[
++            req.kv.req_pool_idx, :computed
++        ].long()
++        scheduler.token_to_kv_pool_allocator.load_cpu_copy(
++            (
++                payload["attention_kv"],
++                (payload["mamba_conv"], payload["mamba_temporal"]),
++            ),
++            indices,
++            mamba_indices=req.kv.mamba_pool_idx,
++        )
++
++    def _slots(self, req):
++        pool = self.scheduler.req_to_token_pool
++        return {
++            "request_row": req.kv.req_pool_idx,
++            "request_row_generation": int(pool.req_generation[req.kv.req_pool_idx]),
++            "mamba_slot": int(req.kv.mamba_pool_idx),
++        }
++
++    def _export(self, request, identity, store):
++        if request.snapshot_id in self.records:
++            raise ValueError("Snapshot ID already has a local execution state")
++        req, batch, computed, batch_index = self._request(request)
++        if request.source_binding is not None:
++            if request.source_binding.get("request_id") != req.rid:
++                raise ValueError(
++                    "Source binding request ID differs from active request"
++                )
++            if (
++                get_parallel().tp_rank == 0
++                and request.source_binding.get("source_engine_instance_id")
++                != self.engine_instance_id
++            ):
++                raise ValueError(
++                    "Source binding engine instance differs from actual TP rank zero"
++                )
++        metadata = self._request_metadata(req, computed, request.source_binding)
++        started = time.perf_counter()
++        payload = self._copy(req, computed)
++        copied = time.perf_counter()
++        state = _state_receipt(payload)
++        stream = io.BytesIO()
++        torch.save(payload, stream)
++        receipt = store.write_rank(
++            request.snapshot_id,
++            tp_rank=get_parallel().tp_rank,
++            tp_size=get_parallel().tp_size,
++            identity=identity,
++            request_metadata=metadata,
++            tensor_metadata=state,
++            payload=stream.getvalue(),
++        )
++        self.records[request.snapshot_id] = {
++            "req": req,
++            "batch": batch,
++            "batch_index": batch_index,
++            "metadata": metadata,
++            "identity": identity,
++            "state": state,
++            "slots": self._slots(req),
++            "released": False,
++            "memory_suspended": False,
++        }
++        return {
++            **state,
++            **metadata,
++            "source_slots": self.records[request.snapshot_id]["slots"],
++            "allocation_epoch": self.records[request.snapshot_id]["slots"][
++                "request_row_generation"
++            ],
++            "old_slots_released": False,
++            "loaded_from_snapshot": False,
++            "allocated_new_slots": False,
++            "save_receipt": receipt,
++            "copy_to_host_s": copied - started,
++            "persist_rank_s": time.perf_counter() - copied,
++        }
++
++    def _preempt(self, request, failures):
++        """Classify while paused on all ranks, then export or cancel exact queued RID.
++
++        A frontend which has not received a token cannot infer that the engine
++        did no work. Only an exact waiting request without native output or any
++        allocated slot is eligible for original-input replay. Unknown states
++        fail closed, and no rank mutates its queue before TP agreement.
++        """
++        scheduler = self.scheduler
++        req = None
++        intent = {"status": "FAILED", "tp_rank": get_parallel().tp_rank}
++        try:
++            if failures:
++                raise ValueError("; ".join(failures))
++            if not scheduler._engine_paused:
++                raise ValueError("pause_generation(in_place) must precede preemption")
++            drained_overlap_results = self._drain_overlap_results()
++            identity = self._validate_identity(request)
++            if not request.snapshot_id or not request.storage_dir:
++                raise ValueError("snapshot_id and storage_dir are required")
++            rid = request.target_rid or request.rid
++            binding = request.source_binding
++            if not isinstance(binding, dict) or binding.get("request_id") != rid:
++                raise ValueError("Source preemption request binding differs")
++            if (
++                get_parallel().tp_rank == 0
++                and binding.get("source_engine_instance_id") != self.engine_instance_id
++            ):
++                raise ValueError("Source preemption engine instance differs")
++            if (
++                type(binding.get("source_execution_generation")) is not int
++                or binding["source_execution_generation"] < 0
++                or any(
++                    not isinstance(binding.get(key), str) or not binding[key]
++                    for key in (
++                        "trajectory_id",
++                        "source_owner_id",
++                        "source_lease_id",
++                        "policy_identity_sha256",
++                        "origin_input_ids_sha256",
++                    )
++                )
++            ):
++                raise ValueError(
++                    "Source preemption has an incomplete execution/input binding"
++                )
++            active = [item for item in scheduler.running_batch.reqs if item.rid == rid]
++            waiting = [item for item in scheduler.waiting_queue if item.rid == rid]
++            if len(active) == 1 and not waiting:
++                req = active[0]
++                if req.finished() or not req.output_ids:
++                    raise ValueError(
++                        "Active request has no portable sampled-output boundary"
++                    )
++                disposition = "ACTIVE_EXPORTED"
++            elif len(waiting) == 1 and not active:
++                req = waiting[0]
++                if (
++                    req.finished()
++                    or req.output_ids
++                    or req.kv.req_pool_idx is not None
++                    or req.kv.mamba_pool_idx is not None
++                    or req.kv.kv_committed_len != 0
++                    or req.kv.holds_kv
++                    or req.kv.retraction_backup is not None
++                    or req.prefix_len != 0
++                    or getattr(getattr(scheduler, "chunked_req", None), "rid", None)
++                    == rid
++                ):
++                    raise ValueError(
++                        "Queued request has sampled output, allocated KV, or in-flight prefill"
++                    )
++                disposition = "PENDING_CANCELLED"
++            else:
++                raise ValueError(
++                    "Source request is absent or not uniquely active/queued"
++                )
++            custom = req.sampling_params.custom_params
++            encoded = (
++                custom.get("trajectory_source_request_v1")
++                if isinstance(custom, dict)
++                else None
++            )
++            if not isinstance(encoded, str):
++                raise ValueError("Native request has no original dispatch provenance")
++            original = json.loads(encoded)
++            expected = {
++                "schema_version": 1,
++                "request_id": rid,
++                "trajectory_id": binding["trajectory_id"],
++                "source_execution_generation": binding["source_execution_generation"],
++                "source_owner_id": binding["source_owner_id"],
++                "source_lease_id": binding["source_lease_id"],
++                "policy_version": identity["weight_version"],
++                "policy_identity_sha256": binding["policy_identity_sha256"],
++                "origin_input_ids_sha256": _json_digest(list(req.origin_input_ids)),
++            }
++            if (
++                not isinstance(original, dict)
++                or type(original.get("source_execution_generation")) is not int
++                or original != expected
++                or binding["origin_input_ids_sha256"]
++                != expected["origin_input_ids_sha256"]
++            ):
++                raise ValueError(
++                    "Native original request policy/generation/input provenance differs"
++                )
++            intent.update(
++                status="READY",
++                source_disposition=disposition,
++                identity=identity,
++                source_binding=dict(binding),
++                origin_input_ids_sha256=_json_digest(list(req.origin_input_ids)),
++                generated_tokens=len(req.output_ids),
++            )
++        except Exception as error:
++            intent["error"] = str(error)
++        intents = [intent]
++        if get_parallel().tp_size > 1:
++            intents = [None] * get_parallel().tp_size
++            torch.distributed.all_gather_object(
++                intents, intent, group=scheduler.tp_cpu_group
++            )
++        if any(row.get("status") != "READY" for row in intents):
++            raise ValueError("Native source preemption rejected: " + str(intents))
++        comparable = [
++            {key: value for key, value in row.items() if key != "tp_rank"}
++            for row in intents
++        ]
++        if any(row != comparable[0] for row in comparable):
++            raise ValueError(
++                "TP ranks disagree on exact source request preemption state"
++            )
++        if intent["source_disposition"] == "ACTIVE_EXPORTED":
++            return {
++                **self._export(
++                    request, identity, TokenKVSnapshotStore(request.storage_dir)
++                ),
++                "source_disposition": "ACTIVE_EXPORTED",
++                "identity": identity,
++            }
++        # Follow the original native waiting-queue abort cleanup, with exact
++        # equality rather than abort_request's RID-prefix matching. Resource
++        # owning/active requests were rejected before this mutation.
++        scheduler._release_aborted_request(req)
++        matches = [
++            index for index, item in enumerate(scheduler.waiting_queue) if item is req
++        ]
++        if len(matches) != 1:
++            raise ValueError(
++                "Paused native waiting request changed before cancellation"
++            )
++        scheduler.waiting_queue.pop(matches[0])
++        scheduler.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
++        return {
++            **intent,
++            "pending_removed": True,
++            "kv_allocated": False,
++            "prepared_while_paused": True,
++            "overlap_results_drained": drained_overlap_results,
++            "native_cancel_mode": "EXACT_WAITING_QUEUE_REMOVE_AFTER_TP_PREPARE",
++        }
++
++    def _read(self, request, identity, store, record):
++        metadata, raw = store.read_rank(
++            request.snapshot_id,
++            tp_rank=get_parallel().tp_rank,
++            tp_size=get_parallel().tp_size,
++            expected_identity=identity,
++            expected_request_metadata=record["metadata"],
++        )
++        payload = torch.load(io.BytesIO(raw), map_location="cpu", weights_only=True)
++        if _state_receipt(payload) != record["state"]:
++            raise ValueError("Serialized state digest/inventory differs from export")
++        return payload
++
++    def _release(self, request, identity, store, record):
++        if record["released"]:
++            raise ValueError("Request slots were already released")
++        req, batch, computed, _ = self._request(request)
++        if (
++            self._request_metadata(req, computed, record["metadata"]["source_binding"])
++            != record["metadata"]
++        ):
++            raise ValueError("Request advanced after snapshot export")
++        if self._slots(req) != record["slots"]:
++            raise ValueError(
++                "Source allocator row/slot generation changed after export"
++            )
++        self._read(request, identity, store, record)
++        if (
++            request.release_full_gpu_pool
++            and not self.scheduler.memory_saver_adapter.enabled
++        ):
++            raise ValueError("Full GPU pool release requires --enable-memory-saver")
++        scheduler = self.scheduler
++        other_active_rids = [item.rid for item in batch.reqs if item is not req]
++        has_other_work = (
++            bool(other_active_rids)
++            or bool(scheduler.waiting_queue)
++            or scheduler.chunked_req is not None
++        )
++        if request.release_full_gpu_pool and has_other_work:
++            raise ValueError(
++                "Full GPU pool release requires no other active or pending requests"
++            )
++        started = time.perf_counter()
++        memory_before = _cuda_memory()
++        allocator = self.scheduler.token_to_kv_pool_allocator
++        before_free = allocator.available_size()
++        before_rows = self.scheduler.req_to_token_pool.available_size()
++        shared_prefix_len = req.kv.cache_protected_len
++        scheduler.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
++        release_kv_cache(req, self.scheduler.tree_cache, checkpoint=False)
++        keep_indices = [
++            index for index, item in enumerate(batch.reqs) if item is not req
++        ]
++        batch.filter_batch(keep_indices=keep_indices)
++        record["released"] = True
++        record["detached"] = True
++        record["batch_index"] = None
++        # The target is absent from every scheduler batch tensor. Other members,
++        # the waiting queue and shared radix prefixes remain native state.
++        if request.release_full_gpu_pool:
++            self.scheduler.weight_updater.release_memory_occupation(
++                ReleaseMemoryOccupationReqInput(tags=["kv_cache"])
++            )
++            record["memory_suspended"] = True
++        memory_after = _cuda_memory()
++        memory_delta = (
++            memory_after["free_bytes"] - memory_before["free_bytes"]
++            if memory_before is not None and memory_after is not None
++            else None
++        )
++        record["full_gpu_pool_released"] = (
++            record["memory_suspended"] and memory_delta is not None and memory_delta > 0
++        )
++        return {
++            **record["state"],
++            **record["metadata"],
++            "source_slots": record["slots"],
++            "allocation_epoch": record["slots"]["request_row_generation"],
++            "old_slots_released": req.kv.req_pool_idx is None
++            and req.kv.mamba_pool_idx is None,
++            "destroyed_old_gpu_slots": False,
++            "detached": True,
++            "engine_generation_unblocked": not self.has_released_request,
++            "old_gpu_state_zeroed": False,
++            "native_release_mode": "release_kv_cache(checkpoint=False)",
++            "shared_prefix_len": shared_prefix_len,
++            "other_active_request_ids": other_active_rids,
++            "allocator_free_tokens_before": before_free,
++            "allocator_free_tokens_after": allocator.available_size(),
++            "request_rows_free_before": before_rows,
++            "request_rows_free_after": self.scheduler.req_to_token_pool.available_size(),
++            "memory_saver_kv_pause_executed": record["memory_suspended"],
++            "full_gpu_pool_released": record["full_gpu_pool_released"],
++            "kv_memory_region_released": record["full_gpu_pool_released"],
++            "weights_memory_region_released": False,
++            "gpu_returned_for_training": False,
++            "gpu_memory_before": memory_before,
++            "gpu_memory_after": memory_after,
++            "gpu_free_bytes_delta": memory_delta,
++            "release_and_destroy_s": time.perf_counter() - started,
++            "release_s": time.perf_counter() - started,
++        }
++
++    def _restore(self, request, identity, store, record):
++        if not record["released"]:
++            raise ValueError("Restore requires released source slots")
++        payload = self._read(request, identity, store, record)
++        started = time.perf_counter()
++        req, batch = record["req"], record["batch"]
++        computed = record["metadata"]["computed_tokens"]
++        req.advance_cache_request_handle()
++        if record["memory_suspended"]:
++            self.scheduler.weight_updater.resume_memory_occupation(
++                ResumeMemoryOccupationReqInput(tags=["kv_cache"])
++            )
++            record["memory_suspended"] = False
++        try:
++            rows, restored = self._allocate_and_load(
++                req, computed, payload, record["state"]
++            )
++            imported = self._prepare_portable_decode_batch(
++                req, rows, computed, record["metadata"]
++            )
++            batch = self._merge_portable_decode_batch(imported)
++        except Exception:
++            # Stay paused on any failure; no request may use unverifiable state.
++            if req.kv.req_pool_idx is not None or req.kv.mamba_pool_idx is not None:
++                release_kv_cache(req, self.scheduler.tree_cache, checkpoint=False)
++            raise
++        self.scheduler.running_batch = batch
++        self.scheduler.cur_batch_for_debug = batch
++        record["released"] = False
++        record["detached"] = False
++        self.resume_metrics[req.rid] = {
++            "resumed_prefill_tokens": 0,
++            "resumed_decode_input_tokens": 0,
++            "resumed_forward_batches": 0,
++            "resumed_prefill_duration_s": None,
++        }
++        destination = self._slots(req)
++        result = {
++            **restored,
++            **record["metadata"],
++            "source_slots": record["slots"],
++            "destination_slots": destination,
++            "allocation_epoch": destination["request_row_generation"],
++            "old_slots_released": True,
++            "detached": False,
++            "loaded_from_snapshot": True,
++            "allocated_new_slots": True,
++            "digestmatch": True,
++            "full_gpu_pool_released": record.get("full_gpu_pool_released", False),
++            "kv_memory_region_released": record.get("full_gpu_pool_released", False),
++            "weights_memory_region_released": False,
++            "gpu_returned_for_training": False,
++            "restore_and_readback_s": time.perf_counter() - started,
++        }
++        del self.records[request.snapshot_id]
++        return result
++
++    def _rank_errors(self, error):
++        errors = [error]
++        if get_parallel().tp_size > 1:
++            errors = [None] * get_parallel().tp_size
++            torch.distributed.all_gather_object(
++                errors, error, group=self.scheduler.tp_cpu_group
++            )
++        failures = [
++            f"rank {rank}: {message}" for rank, message in enumerate(errors) if message
++        ]
++        if failures:
++            raise ValueError("; ".join(failures))
++
++    def _allocate_and_load(self, req, computed, payload, expected_state):
++        if req.kv.holds_kv or req.kv.holds_mamba:
++            raise ValueError(
++                "Portable allocation requires an unowned request resource record"
++            )
++        pool = self.scheduler.req_to_token_pool
++        allocator = self.scheduler.token_to_kv_pool_allocator
++        allocated = (
++            (computed + allocator.page_size - 1) // allocator.page_size
++        ) * allocator.page_size
++        rows = pool.alloc([req])
++        if rows is None:
++            raise ValueError("No free request or GDN rows for portable restore")
++        indices = allocator.alloc(allocated)
++        if indices is None:
++            pool.free_mamba_cache(req)
++            pool.free(req)
++            raise ValueError("No free full-attention KV slots for portable restore")
++        pool.req_to_token[req.kv.req_pool_idx, :computed] = indices[:computed].to(
++            torch.int32
++        )
++        req.kv.kv_committed_len = computed
++        req.kv.kv_allocated_len = computed
++        req.kv.cache_protected_len = 0
++        req.kv.cache_inserted_len = 0
++        req.prefix_len = computed
++        req.refresh_fill_ids()
++        req.extend_end = computed
++        # Every imported token owns a new physical slot. Anchor its native
++        # cache lifecycle at the empty root, so completion can release its
++        # reference and insert the restored sequence into a live radix tree.
++        tree_cache = self.scheduler.tree_cache
++        if not tree_cache.disable:
++            root = tree_cache.root_node_handle(extra_key=req.extra_key)
++            req.last_node = root
++            req.last_host_node = root
++            req.best_match_node = root
++            req.lock = tree_cache.lock(root)
++        self._load(req, computed, payload)
++        req.kv.mamba_needs_clear = False
++        readback = _state_receipt(self._copy(req, computed))
++        if readback != expected_state:
++            raise ValueError("Portable import failed GPU tensor readback verification")
++        return rows, readback
++
++    def _prepare_portable_decode_batch(self, req, rows, computed, metadata):
++        scheduler = self.scheduler
++        batch = ScheduleBatch.init_new(
++            [req],
++            scheduler.req_to_token_pool,
++            scheduler.token_to_kv_pool_allocator,
++            scheduler.tree_cache,
++            scheduler.model_config,
++            scheduler.enable_overlap,
++            scheduler.spec_algorithm,
++        )
++        batch.forward_mode = ForwardMode.DECODE
++        batch.req_pool_indices = torch.tensor(
++            rows, dtype=torch.int64, device=batch.device
++        )
++        batch.req_pool_indices_cpu = torch.tensor(rows, dtype=torch.int64)
++        batch.seq_lens = torch.tensor(
++            [computed], dtype=torch.int64, device=batch.device
++        )
++        batch.seq_lens_cpu = torch.tensor([computed], dtype=torch.int64)
++        batch.orig_seq_lens = torch.tensor(
++            [computed], dtype=torch.int32, device=batch.device
++        )
++        batch.seq_lens_sum = computed
++        batch.multimodal_inputs = [None]
++        batch.top_logprobs_nums = [req.logprob.top_logprobs_num]
++        batch.token_ids_logprobs = [req.logprob.token_ids_logprob]
++        batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
++            batch, scheduler.model_config.vocab_size
++        )
++        penalties = batch.sampling_info.penalizer_orchestrator
++        if penalties.is_required:
++            # Native prepare_for_decode adds the pending last token. Rebuild
++            # only earlier accepted outputs so penalties count each token once.
++            for token in metadata["output_ids"][:-1]:
++                penalties.cumulate_output_tokens(
++                    torch.tensor([token], dtype=torch.int64, device=batch.device)
++                )
++        scheduler.future_map.stash(
++            batch.req_pool_indices,
++            RelayPayload(
++                bonus_tokens=torch.tensor(
++                    [metadata["pending_input_token"]],
++                    dtype=torch.int64,
++                    device=batch.device,
++                )
++            ),
++        )
++        batch.input_ids = None  # Native resolve_forward_inputs consumes relay.
++        return batch
++
++    def _merge_portable_decode_batch(self, imported):
++        scheduler = self.scheduler
++        running = scheduler.running_batch
++        if running is None or running.is_empty():
++            running = imported
++        else:
++            # Native merge preserves existing members, penalty state and
++            # FutureMap rows before appending the restored request.
++            running.merge_batch(imported)
++        scheduler.running_batch = running
++        scheduler.cur_batch_for_debug = running
++        return running
++
++    def import_for_generation(self, req, descriptor):
++        """Import into a newly registered native /generate Req, never records[]."""
++        scheduler = self.scheduler
++        started = time.perf_counter()
++        error = None
++        try:
++            failures = self._check_runtime()
++            if failures:
++                raise ValueError("; ".join(failures))
++            # Input handling is a synchronous scheduler boundary. Finish queued
++            # overlap results first, then merge into the current native batch.
++            self._drain_overlap_results()
++            other_active_before_import = [
++                item.rid
++                for item in getattr(
++                    getattr(scheduler, "running_batch", None), "reqs", ()
++                )
++                if item.rid != req.rid
++            ]
++            identity = self._validate_identity(SimpleNamespace(**descriptor))
++            store = TokenKVSnapshotStore(descriptor["storage_dir"])
++            rank, raw = store.read_rank(
++                descriptor["snapshot_id"],
++                tp_rank=get_parallel().tp_rank,
++                tp_size=get_parallel().tp_size,
++                expected_identity=identity,
++            )
++            metadata = rank["request_metadata"]
++            _validate_portable_metadata(metadata, descriptor)
++            if list(req.origin_input_ids) != metadata["origin_input_ids"]:
++                raise ValueError(
++                    "New native request input differs from committed source"
++                )
++            if (
++                _resolved_sampling_params(req.sampling_params)
++                != metadata["resolved_sampling_params"]
++            ):
++                raise ValueError(
++                    "New native request sampling differs from committed source"
++                )
++            payload = torch.load(io.BytesIO(raw), map_location="cpu", weights_only=True)
++            state = _state_receipt(payload)
++            if state != rank["tensor_metadata"]:
++                raise ValueError("Portable snapshot tensor inventory/digest differs")
++        except Exception as failure:
++            error = str(failure)
++        # All ranks validate the committed input before any rank mutates its pool.
++        self._rank_errors(error)
++
++        error = None
++        try:
++            req.output_ids = array("q", metadata["output_ids"])
++            req._token_kv_output_version_spans = [
++                dict(span) for span in metadata["output_weight_versions"]
++            ]
++            req.logprob.output_token_logprobs_val = list(metadata["output_logprobs"])
++            req.logprob.output_token_logprobs_idx = list(
++                metadata["output_logprob_token_ids"]
++            )
++            req.input_logprob_sent = True  # This scope only returns output logprobs.
++            req.temp_scaled_logprobs = metadata["temp_scaled_logprobs"]
++            req.top_p_normalized_logprobs = metadata["top_p_normalized_logprobs"]
++            req.decode_batch_idx = metadata["decode_batch_idx"]
++            reasoning = metadata["reasoning_state"]
++            req._is_reasoning_over = reasoning["is_reasoning_over"]
++            req.reasoning_tokens = reasoning["reasoning_tokens"]
++            req._think_end_match_len = reasoning["think_end_match_len"]
++            # The matcher is rebuilt from the same resolved stop/reasoning params.
++            # A new detokenizer emits the complete saved prefix plus the tail once.
++            req.send_token_offset = 0
++            req.send_decode_id_offset = 0
++            req.send_output_token_logprobs_offset = 0
++            req.surr_offset = None
++            req.read_offset = None
++            req.decoded_text = ""
++            computed = metadata["computed_tokens"]
++            rows, readback = self._allocate_and_load(req, computed, payload, state)
++            imported = self._prepare_portable_decode_batch(
++                req, rows, computed, metadata
++            )
++            batch = self._merge_portable_decode_batch(imported)
++        except Exception as failure:
++            error = str(failure)
++        try:
++            self._rank_errors(error)
++        except Exception:
++            if req.kv.req_pool_idx is not None or req.kv.mamba_pool_idx is not None:
++                release_kv_cache(req, scheduler.tree_cache, checkpoint=False)
++            raise
++
++        scheduler.running_batch = batch
++        scheduler.cur_batch_for_debug = batch
++        self.resume_metrics[req.rid] = {
++            "committed_prefix_tokens": computed,
++            "actual_input_counter_status": "ARMED_NOT_YET_EXECUTED",
++            "actual_recomputed_tokens": 0,
++            "actual_processed_input_tokens": 0,
++            "actual_extend_input_tokens": 0,
++            "actual_decode_input_tokens": 0,
++            "actual_completed_forward_iters": [],
++            "resumed_prefill_tokens": 0,
++            "resumed_decode_input_tokens": 0,
++            "resumed_forward_batches": 0,
++            "resumed_prefill_duration_s": None,
++        }
++        destination = self._slots(req)
++        self.portable_restore_by_rid[req.rid] = {
++            **readback,
++            "status": "PASS",
++            "snapshot_id": descriptor["snapshot_id"],
++            "identity": identity,
++            "source_rid": metadata["rid"],
++            "target_rid": req.rid,
++            "source_binding": metadata["source_binding"],
++            "engine_instance_id": self.engine_instance_id,
++            "computed_tokens": computed,
++            "pending_input_token": metadata["pending_input_token"],
++            "remaining_generation_tokens": metadata["remaining_generation_tokens"],
++            "output_ids": metadata["output_ids"],
++            "output_logprobs": metadata["output_logprobs"],
++            "source_stream_cursors": metadata["source_stream_cursors"],
++            "target_stream_offset": 0,
++            "stream_returns_full_output": True,
++            "request_reconstructed": True,
++            "other_active_request_ids_before_import": other_active_before_import,
++            "active_request_ids_after_import": [item.rid for item in batch.reqs],
++            "from_retained_cpu_record": False,
++            "sampling_state_recovery": "NORMALIZED_PARAMS_AND_HISTORY_RECONSTRUCTED",
++            "sampling_rng_recovery": "FUNCTIONAL_SAMPLING_EQUIVALENCE_NO_GLOBAL_RNG_REPLAY",
++            "loaded_from_snapshot": True,
++            "allocated_new_slots": True,
++            "digestmatch": True,
++            "destination_slots": destination,
++            "allocation_epoch": destination["request_row_generation"],
++            "manifest_ref": store.receipt(descriptor["snapshot_id"])["manifest_ref"],
++            "restore_and_readback_s": time.perf_counter() - started,
++            "recovery_scope": "PORTABLE_FRESH_ENGINE_NATIVE_DECODE",
++        }
++        return self.portable_restore_by_rid[req.rid]
++
++    def capture_native_input_intervals(self, batch):
++        """Copy physical-import input positions before this actual native forward."""
++        rows = []
++        for index, req in enumerate(batch.reqs):
++            metrics = self.resume_metrics.get(req.rid, {})
++            prefix = metrics.get("committed_prefix_tokens")
++            if type(prefix) is not int:
++                continue
++            try:
++                if batch.forward_mode.is_extend():
++                    start, end = req.prefix_len, req.extend_end
++                    kind = "extend"
++                elif batch.forward_mode.is_decode():
++                    lengths = batch.seq_lens_cpu
++                    if getattr(lengths, "is_cuda", False):
++                        raise ValueError("counter cannot copy CUDA lengths")
++                    value = lengths[index]
++                    start = int(value.item() if hasattr(value, "item") else value) - 1
++                    end, kind = start + 1, "decode"
++                else:
++                    raise ValueError("unsupported physical input mode")
++                if (
++                    type(start) is not int
++                    or type(end) is not int
++                    or start < 0
++                    or end <= start
++                    or type(batch.forward_iter) is not int
++                ):
++                    raise ValueError("missing native input interval")
++                rows.append(
++                    (
++                        req.rid,
++                        batch.forward_iter,
++                        kind,
++                        start,
++                        end,
++                        prefix,
++                        str(get_serving().weight_version),
++                    )
++                )
++            except Exception:
++                rows.append(
++                    (
++                        req.rid,
++                        getattr(batch, "forward_iter", None),
++                        "unavailable",
++                        None,
++                        None,
++                        prefix,
++                        None,
++                    )
++                )
++        return tuple(rows)
++
++    def observe_native_input_intervals(self, intervals):
++        """Count only intervals carried by this successfully processed result."""
++        for rid, forward, kind, start, end, prefix, version in intervals or ():
++            metrics = self.resume_metrics.get(rid)
++            if metrics is None or "committed_prefix_tokens" not in metrics:
++                continue
++            if metrics["actual_input_counter_status"] == "UNAVAILABLE":
++                continue
++            if (
++                kind == "unavailable"
++                or prefix != metrics["committed_prefix_tokens"]
++                or version != str(get_serving().weight_version)
++            ):
++                metrics["actual_input_counter_status"] = "UNAVAILABLE"
++                metrics["actual_recomputed_tokens"] = None
++                continue
++            if forward in metrics["actual_completed_forward_iters"]:
++                continue
++            metrics["actual_completed_forward_iters"].append(forward)
++            metrics["actual_processed_input_tokens"] += end - start
++            metrics["actual_" + kind + "_input_tokens"] += end - start
++            metrics["actual_recomputed_tokens"] += max(
++                0, min(end, prefix) - max(start, 0)
++            )
++            metrics["actual_input_counter_status"] = "OBSERVED_COMPLETED_NATIVE_FORWARD"
++
++    def observe_batch_result(self, batch):
++        for index, req in enumerate(batch.reqs):
++            # Observe the actual version after the real batch result was processed.
++            spans = getattr(req, "_token_kv_output_version_spans", [])
++            previous_end = spans[-1]["end"] if spans else 0
++            end = len(req.output_ids)
++            version = get_serving().weight_version
++            if end > previous_end:
++                if spans and spans[-1]["version"] == version:
++                    spans[-1]["end"] = end
++                else:
++                    spans.append(
++                        {"version": version, "start": previous_end, "end": end}
++                    )
++                req._token_kv_output_version_spans = spans
++            metrics = self.resume_metrics.get(req.rid)
++            if metrics is None:
++                continue
++            if batch.forward_mode.is_decode():
++                metrics["resumed_decode_input_tokens"] += 1
++                metrics["resumed_forward_batches"] += 1
++            elif batch.forward_mode.is_extend():
++                lengths = getattr(batch, "extend_lens", None)
++                if lengths is None:
++                    metrics["resumed_prefill_tokens"] = None
++                elif metrics["resumed_prefill_tokens"] is not None:
++                    metrics["resumed_prefill_tokens"] += int(lengths[index])
++                metrics["resumed_forward_batches"] += 1
++
++    def _scheduler_process_identity(self):
++        """Observe this actual scheduler CUDA context; no allocation or inference."""
++        observed = {
++            "pid": os.getpid(),
++            "hostname": socket.gethostname(),
++            "tp_rank": get_parallel().tp_rank,
++            "cuda_context_initialized": torch.cuda.is_initialized(),
++        }
++        try:
++            if not observed["cuda_context_initialized"]:
++                raise ValueError("Scheduler CUDA context is not initialized")
++            device = torch.cuda.current_device()
++            properties = torch.cuda.get_device_properties(device)
++            uuid = getattr(properties, "uuid", None)
++            if uuid is None:
++                raise ValueError("Scheduler CUDA device UUID is unavailable")
++            if isinstance(uuid, bytes):
++                try:
++                    uuid = uuid.decode("ascii")
++                except UnicodeDecodeError:
++                    uuid = uuid.hex()
++            observed.update(status="OBSERVED", device_index=device, gpu_uuid=str(uuid))
++        except Exception as error:
++            observed.update(
++                status="UNAVAILABLE",
++                gpu_uuid=None,
++                error_type=type(error).__name__,
++                error_message=str(error)[:240],
++            )
++        return observed
++
++    def handle(self, request):
++        started = time.perf_counter()
++        local = {"tp_rank": get_parallel().tp_rank}
++        try:
++            failures = self._check_runtime()
++            if request.operation == "inspect":
++                local.update(
++                    status="PASS" if not failures else "UNSUPPORTED",
++                    identity=self._identity() if not failures else None,
++                    local_cache_layout=self._cache_layout() if not failures else None,
++                    supported=not failures,
++                    runtime_constraints=failures,
++                    resume_metrics_by_rid=self.resume_metrics,
++                    portable_restore_by_rid=self.portable_restore_by_rid,
++                    engine_instance_id=self.engine_instance_id,
++                    scheduler_process_identity=self._scheduler_process_identity(),
++                )
++            elif request.operation == "preempt":
++                local.update(self._preempt(request, failures), status="PASS")
++            elif request.operation == "publish_weight_version":
++                if failures:
++                    raise ValueError("; ".join(failures))
++                # Native weight publication runs on an idle scheduler without
++                # requiring the separate snapshot pause/resume protocol.
++                if not self.scheduler.is_fully_idle():
++                    raise ValueError(
++                        "publish_weight_version requires no active, queued, or overlap requests"
++                    )
++                if not request.expected_weight_version:
++                    raise ValueError("expected_weight_version is required")
++                if not self.scheduler.flush_cache():
++                    raise ValueError("native flush_cache failed")
++                self.scheduler.record_weight_version_change(
++                    request.expected_weight_version
++                )
++                local.update(
++                    status="PASS",
++                    identity=self._identity(),
++                    flushed_cache=True,
++                )
++            else:
++                if failures:
++                    raise ValueError("; ".join(failures))
++                if not self.scheduler._engine_paused:
++                    raise ValueError(
++                        "pause_generation(in_place) must precede snapshot operations"
++                    )
++                drained_overlap_results = self._drain_overlap_results()
++                if not request.snapshot_id or not request.storage_dir:
++                    raise ValueError("snapshot_id and storage_dir are required")
++                identity = self._validate_identity(request)
++                store = TokenKVSnapshotStore(request.storage_dir)
++                if request.operation == "export":
++                    receipt = self._export(request, identity, store)
++                elif request.operation in ("release", "restore"):
++                    record = self.records.get(request.snapshot_id)
++                    if record is None:
++                        raise ValueError("No retained CPU request for snapshot_id")
++                    if request.operation == "release":
++                        receipt = self._release(request, identity, store, record)
++                    else:
++                        receipt = self._restore(request, identity, store, record)
++                else:
++                    raise ValueError("Unknown snapshot operation")
++                local.update(
++                    receipt,
++                    status="PASS",
++                    identity=identity,
++                    overlap_results_drained=drained_overlap_results,
++                )
++        except Exception as error:
++            local.update(status="FAILED", error=str(error))
++        local["operation_s"] = time.perf_counter() - started
++        results = [local]
++        if get_parallel().tp_size > 1:
++            results = [None] * get_parallel().tp_size
++            torch.distributed.all_gather_object(
++                results, local, group=self.scheduler.tp_cpu_group
++            )
++        return TokenKVSnapshotReqOutput(
++            success=all(result["status"] == "PASS" for result in results),
++            results=results,
++        )
+diff --git a/python/sglang/srt/managers/tokenizer_control_mixin.py b/python/sglang/srt/managers/tokenizer_control_mixin.py
+index f62afbae8e..cf2b824009 100644
+--- a/python/sglang/srt/managers/tokenizer_control_mixin.py
++++ b/python/sglang/srt/managers/tokenizer_control_mixin.py
+@@ -3,6 +3,7 @@ from __future__ import annotations
+ import asyncio
+ import hashlib
+ import logging
++import os
+ import time
+ import uuid
+ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+@@ -71,6 +72,8 @@ from sglang.srt.managers.io_struct import (
+     SetInternalStateReqOutput,
+     SlowDownReqInput,
+     SlowDownReqOutput,
++    TokenKVSnapshotReqInput,
++    TokenKVSnapshotReqOutput,
+     UnloadLoRAAdapterReqInput,
+     UnloadLoRAAdapterReqOutput,
+     UpdateWeightsFromDistributedReqInput,
+@@ -107,6 +110,7 @@ logger = logging.getLogger(__name__)
+ # Each entry creates self.{prefix}_communicator and registers
+ # response_type -> communicator.handle_recv in the dispatch table.
+ _COMMUNICATOR_SPECS = [
++    ("token_kv_snapshot", TokenKVSnapshotReqOutput),
+     ("init_weights_update_group", InitWeightsUpdateGroupReqOutput),
+     ("destroy_weights_update_group", DestroyWeightsUpdateGroupReqOutput),
+     ("update_weights_from_distributed", UpdateWeightsFromDistributedReqOutput),
+@@ -193,6 +197,72 @@ class TokenizerControlMixin:
+             dispatch_pairs.append((resp_type, comm.handle_recv))
+         self._result_dispatcher += TypeBasedDispatcher(dispatch_pairs)
+ 
++    async def token_kv_snapshot(self: TokenizerManager, obj: TokenKVSnapshotReqInput):
++        self.auto_create_handle_loop()
++        responses = await self.token_kv_snapshot_communicator(obj)
++        ranks = [rank for response in responses for rank in response.results]
++        success = bool(ranks) and all(rank["status"] == "PASS" for rank in ranks)
++        manifest = None
++        manifest_ref = None
++        manifest_commit_s = None
++        physical_export = obj.operation == "export" or (
++            obj.operation == "preempt"
++            and bool(ranks)
++            and all(
++                rank.get("source_disposition") == "ACTIVE_EXPORTED" for rank in ranks
++            )
++        )
++        if success and physical_export:
++            # All TP ranks have written their payload before this commit. A
++            # release command must independently verify the committed files.
++            import time
++
++            from sglang.srt.mem_cache.token_kv_snapshot_store import (
++                TokenKVSnapshotStore,
++            )
++
++            store = TokenKVSnapshotStore(obj.storage_dir)
++            commit_started = time.perf_counter()
++            manifest = store.commit(
++                obj.snapshot_id, tp_size=ranks[0]["identity"]["tp_size"]
++            )
++            manifest_ref = store.receipt(obj.snapshot_id)["manifest_ref"]
++            manifest_commit_s = time.perf_counter() - commit_started
++        if success and obj.operation == "release":
++            # A detached request no longer belongs to the source batch. Other
++            # native requests may resume while it is restored on another worker.
++            detached = all(
++                rank.get("detached") is True
++                and rank.get("engine_generation_unblocked") is True
++                for rank in ranks
++            )
++            if not detached:
++                self._token_kv_pending_restore = obj.snapshot_id
++        if success and obj.operation == "restore":
++            self._token_kv_pending_restore = None
++        first = ranks[0] if ranks else {}
++        return {
++            "status": "PASS" if success else "FAILED",
++            "operation": obj.operation,
++            "snapshot_id": obj.snapshot_id,
++            "identity": first.get("identity"),
++            "engine_instance_id": first.get("engine_instance_id"),
++            "portable_restore_supported": first.get("supported", False),
++            "supported": first.get("supported", success),
++            "runtime_constraints": first.get("runtime_constraints", []),
++            "ranks": ranks,
++            "output_ids": first.get("output_ids"),
++            "output_logprobs": first.get("output_logprobs"),
++            "source_binding": first.get("source_binding"),
++            "output_weight_versions": first.get("output_weight_versions"),
++            "manifest": manifest,
++            "manifest_ref": manifest_ref,
++            "manifest_commit_s": manifest_commit_s,
++            "snapshot_committed": manifest is not None,
++            "save_ref": obj.storage_dir,
++            "recovery_scope": "LOCAL_FRESH_SLOT_RESTORE",
++        }
++
+     def update_control_communicator_fan_out(self: TokenizerManager, worker_count: int):
+         primary_group_control = (
+             get_parallel().attn_dp_enabled
+@@ -1042,6 +1112,22 @@ class TokenizerControlMixin:
+     ) -> None:
+         self.auto_create_handle_loop()
+         await self.update_weight_version_communicator(obj)
++        if os.environ.get("SGLANG_ENABLE_TOKEN_KV_SNAPSHOT") == "1":
++            observed = await self.token_kv_snapshot(
++                TokenKVSnapshotReqInput(operation="inspect")
++            )
++            ranks = observed.get("ranks", [])
++            if (
++                observed.get("status") != "PASS"
++                or len(ranks) != get_parallel().tp_size
++                or {row.get("tp_rank") for row in ranks}
++                != set(range(get_parallel().tp_size))
++                or any(
++                    row.get("identity", {}).get("weight_version") != obj.new_version
++                    for row in ranks
++                )
++            ):
++                raise RuntimeError("Native scheduler weight-version readback differs")
+         self._update_weight_version_if_provided(obj.new_version)
+ 
+     def _update_weight_version_if_provided(
+diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
+index 807eef50e4..870b4198f1 100644
+--- a/python/sglang/srt/managers/tokenizer_manager.py
++++ b/python/sglang/srt/managers/tokenizer_manager.py
+@@ -915,6 +915,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+         self.auto_create_handle_loop()
+ 
+         # Normalize the request
++        if isinstance(obj, GenerateReqInput) and obj.token_kv_restore is not None:
++            from sglang.srt.managers.token_kv_snapshot import (
++                prepare_portable_generate_input,
++            )
++
++            prepare_portable_generate_input(obj)
+         obj.normalize_batch_and_arguments()
+         self._set_default_priority(obj)
+         if (
+@@ -1574,8 +1580,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+             custom_params = dict(sampling_kwargs.get("custom_params") or {})
+             custom_params["thinking_budget"] = obj.max_thinking_tokens
+             sampling_kwargs["custom_params"] = custom_params
+-        sampling_params = self.sampling_params_class(**sampling_kwargs)
+-        sampling_params.normalize(self.tokenizer)
++        if isinstance(obj, GenerateReqInput) and obj.token_kv_restore is not None:
++            from sglang.srt.managers.token_kv_snapshot import (
++                sampling_params_from_snapshot,
++            )
++
++            sampling_params = sampling_params_from_snapshot(obj.sampling_params)
++        else:
++            sampling_params = self.sampling_params_class(**sampling_kwargs)
++            sampling_params.normalize(self.tokenizer)
+         sampling_params.verify(self.model_config.vocab_size)
+         _validate_watermark_request(sampling_params)
+ 
+@@ -1636,6 +1649,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
+                 token_indices_to_pool=obj.token_indices_to_pool,
+                 encoder_urls=obj.encoder_urls,
++                token_kv_restore=obj.token_kv_restore,
+             )
+         elif isinstance(obj, EmbeddingReqInput):
+             # Resolve unresolved embed overrides now that input_ids are available
+@@ -2292,6 +2306,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                     await asyncio.sleep(1.0)
+ 
+     async def continue_generation(self, obj: ContinueGenerationReqInput):
++        if getattr(self, "_token_kv_pending_restore", None) is not None:
++            raise ValueError("Cannot continue before released snapshot is restored")
+         async with self.is_pause_cond:
+             self.is_pause = False
+             await self._async_dispatch_to_scheduler(obj)
+diff --git a/python/sglang/srt/mem_cache/token_kv_snapshot_store.py b/python/sglang/srt/mem_cache/token_kv_snapshot_store.py
+new file mode 100644
+index 0000000000..ce3c13632b
+--- /dev/null
++++ b/python/sglang/srt/mem_cache/token_kv_snapshot_store.py
+@@ -0,0 +1,280 @@
++"""Atomic, digest-checked files for an opt-in same-version decode checkpoint.
++
++This stores bytes exported by the engine. It does not infer that a token prefix,
++cache hit, or successfully written file constitutes a restored inference state.
++Each TP rank must write its actual tensors before rank zero commits the group.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++import re
++import tempfile
++from pathlib import Path
++from typing import Any
++
++
++class TokenKVSnapshotError(ValueError):
++    pass
++
++
++def _canonical(value: Any) -> bytes:
++    return json.dumps(
++        value, sort_keys=True, separators=(",", ":"), allow_nan=False
++    ).encode("utf-8")
++
++
++def _digest(value: bytes) -> str:
++    return hashlib.sha256(value).hexdigest()
++
++
++def _fsync_directory(directory: Path) -> None:
++    fd = os.open(directory, os.O_RDONLY)
++    try:
++        os.fsync(fd)
++    finally:
++        os.close(fd)
++
++
++def _atomic_write(destination: Path, data: bytes) -> None:
++    fd, temporary = tempfile.mkstemp(prefix=".writing-", dir=destination.parent)
++    try:
++        with os.fdopen(fd, "wb") as handle:
++            handle.write(data)
++            handle.flush()
++            os.fsync(handle.fileno())
++        os.replace(temporary, destination)
++        _fsync_directory(destination.parent)
++    finally:
++        if os.path.exists(temporary):
++            os.unlink(temporary)
++
++
++class TokenKVSnapshotStore:
++    """Write-once snapshots on a shared filesystem; no pickle is loaded here.
++
++    The scheduler supplies identities from the actual engine, not request labels.
++    A unique snapshot ID is also its storage generation. Repeated writes with the
++    exact same bytes are harmless; conflicting writers and incomplete TP groups
++    are rejected. The engine must deserialize only after ``read_rank`` succeeds.
++    """
++
++    def __init__(self, root: str | Path):
++        self.root = Path(root).resolve()
++        self.root.mkdir(parents=True, exist_ok=True)
++
++    def _directory(self, snapshot_id: str) -> Path:
++        if not isinstance(snapshot_id, str) or not re.fullmatch(
++            r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", snapshot_id
++        ):
++            raise TokenKVSnapshotError("invalid snapshot ID")
++        directory = self.root / snapshot_id
++        if directory.is_symlink():
++            raise TokenKVSnapshotError("snapshot directory may not be a symlink")
++        return directory
++
++    @staticmethod
++    def _validate_rank(tp_rank: int, tp_size: int) -> None:
++        if (
++            type(tp_rank) is not int
++            or type(tp_size) is not int
++            or tp_size < 1
++            or not 0 <= tp_rank < tp_size
++        ):
++            raise TokenKVSnapshotError("invalid TP rank or world size")
++
++    @staticmethod
++    def _validate_identity(identity: dict[str, Any]) -> None:
++        if not isinstance(identity, dict) or not identity:
++            raise TokenKVSnapshotError("actual engine identity is required")
++        if "weight_version" not in identity or identity["weight_version"] is None:
++            raise TokenKVSnapshotError("actual engine weight version is required")
++        _canonical(identity)
++
++    @staticmethod
++    def _load_json(path: Path) -> dict[str, Any]:
++        try:
++            value = json.loads(path.read_bytes())
++        except (OSError, ValueError) as error:
++            raise TokenKVSnapshotError(f"missing or invalid {path.name}") from error
++        if not isinstance(value, dict):
++            raise TokenKVSnapshotError(f"invalid object in {path.name}")
++        return value
++
++    def write_rank(
++        self,
++        snapshot_id: str,
++        *,
++        tp_rank: int,
++        tp_size: int,
++        identity: dict[str, Any],
++        request_metadata: dict[str, Any],
++        tensor_metadata: dict[str, Any],
++        payload: bytes,
++    ) -> dict[str, Any]:
++        self._validate_rank(tp_rank, tp_size)
++        self._validate_identity(identity)
++        if not isinstance(payload, bytes) or not payload:
++            raise TokenKVSnapshotError("actual nonempty tensor payload is required")
++        if not isinstance(request_metadata, dict) or not request_metadata:
++            raise TokenKVSnapshotError("request state metadata is required")
++        if not isinstance(tensor_metadata, dict) or not tensor_metadata:
++            raise TokenKVSnapshotError("tensor layout metadata is required")
++        directory = self._directory(snapshot_id)
++        directory.mkdir(exist_ok=True)
++        metadata = {
++            "schema_version": 1,
++            "snapshot_id": snapshot_id,
++            "tp_rank": tp_rank,
++            "tp_size": tp_size,
++            "identity": identity,
++            "request_metadata": request_metadata,
++            "tensor_metadata": tensor_metadata,
++            "payload_name": f"rank-{tp_rank}.bin",
++            "payload_bytes": len(payload),
++            "payload_sha256": _digest(payload),
++        }
++        metadata_path = directory / f"rank-{tp_rank}.json"
++        # One engine scheduler owns each TP rank. The exclusive lock also rejects
++        # a concurrent/late writer attempting to replace its committed history.
++        lock = directory / f"rank-{tp_rank}.lock"
++        try:
++            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
++        except FileExistsError as error:
++            raise TokenKVSnapshotError("concurrent rank writer") from error
++        os.close(fd)
++        try:
++            if metadata_path.exists():
++                existing = self._load_json(metadata_path)
++                if _canonical(existing) != _canonical(metadata):
++                    raise TokenKVSnapshotError("conflicting snapshot rank write")
++                self._checked_payload(directory, existing)
++                return existing
++            if (directory / "COMMITTED.json").exists():
++                raise TokenKVSnapshotError("cannot append to committed snapshot")
++            _atomic_write(directory / metadata["payload_name"], payload)
++            _atomic_write(metadata_path, _canonical(metadata))
++            return metadata
++        finally:
++            lock.unlink()
++
++    @staticmethod
++    def _checked_payload(directory: Path, metadata: dict[str, Any]) -> bytes:
++        expected_name = f"rank-{metadata['tp_rank']}.bin"
++        if metadata.get("payload_name") != expected_name:
++            raise TokenKVSnapshotError("invalid payload name")
++        path = directory / expected_name
++        if path.is_symlink():
++            raise TokenKVSnapshotError("payload may not be a symlink")
++        try:
++            payload = path.read_bytes()
++        except OSError as error:
++            raise TokenKVSnapshotError("missing tensor payload") from error
++        if len(payload) != metadata.get("payload_bytes") or _digest(
++            payload
++        ) != metadata.get("payload_sha256"):
++            raise TokenKVSnapshotError("tensor payload integrity mismatch")
++        return payload
++
++    def commit(self, snapshot_id: str, *, tp_size: int) -> dict[str, Any]:
++        self._validate_rank(0, tp_size)
++        directory = self._directory(snapshot_id)
++        members = []
++        shared = None
++        for rank in range(tp_size):
++            member = self._load_json(directory / f"rank-{rank}.json")
++            if (
++                member.get("schema_version") != 1
++                or member.get("snapshot_id") != snapshot_id
++                or member.get("tp_rank") != rank
++                or member.get("tp_size") != tp_size
++            ):
++                raise TokenKVSnapshotError("rank layout mismatch")
++            self._validate_identity(member.get("identity"))
++            current = _canonical([member["identity"], member["request_metadata"]])
++            if shared is not None and current != shared:
++                raise TokenKVSnapshotError("TP ranks disagree on model/request state")
++            shared = current
++            self._checked_payload(directory, member)
++            members.append(
++                {"rank": rank, "metadata_sha256": _digest(_canonical(member))}
++            )
++        manifest = {
++            "schema_version": 1,
++            "snapshot_id": snapshot_id,
++            "tp_size": tp_size,
++            "shared_state_sha256": _digest(shared),
++            "members": members,
++        }
++        committed = directory / "COMMITTED.json"
++        if committed.exists():
++            if _canonical(self._load_json(committed)) != _canonical(manifest):
++                raise TokenKVSnapshotError("conflicting snapshot commit")
++        else:
++            _atomic_write(committed, _canonical(manifest))
++        return manifest
++
++    def read_rank(
++        self,
++        snapshot_id: str,
++        *,
++        tp_rank: int,
++        tp_size: int,
++        expected_identity: dict[str, Any],
++        expected_request_metadata: dict[str, Any] | None = None,
++    ) -> tuple[dict[str, Any], bytes]:
++        self._validate_rank(tp_rank, tp_size)
++        self._validate_identity(expected_identity)
++        directory = self._directory(snapshot_id)
++        manifest = self._load_json(directory / "COMMITTED.json")
++        if (
++            manifest.get("schema_version") != 1
++            or manifest.get("snapshot_id") != snapshot_id
++            or manifest.get("tp_size") != tp_size
++            or [m.get("rank") for m in manifest.get("members", [])]
++            != list(range(tp_size))
++        ):
++            raise TokenKVSnapshotError("uncommitted or incompatible TP snapshot")
++        metadata = self._load_json(directory / f"rank-{tp_rank}.json")
++        if (
++            metadata.get("schema_version") != 1
++            or metadata.get("snapshot_id") != snapshot_id
++            or metadata.get("tp_rank") != tp_rank
++            or metadata.get("tp_size") != tp_size
++            or _digest(_canonical(metadata))
++            != manifest["members"][tp_rank].get("metadata_sha256")
++        ):
++            raise TokenKVSnapshotError("rank metadata integrity mismatch")
++        if _canonical(metadata["identity"]) != _canonical(expected_identity):
++            raise TokenKVSnapshotError("model/version/cache layout identity mismatch")
++        shared = _canonical([metadata["identity"], metadata["request_metadata"]])
++        if _digest(shared) != manifest.get("shared_state_sha256"):
++            raise TokenKVSnapshotError("request prefix integrity mismatch")
++        if expected_request_metadata is not None and _canonical(
++            metadata["request_metadata"]
++        ) != _canonical(expected_request_metadata):
++            raise TokenKVSnapshotError("request history mismatch")
++        return metadata, self._checked_payload(directory, metadata)
++
++    def receipt(self, snapshot_id: str) -> dict[str, Any]:
++        """Return a reference to the actual commit, rather than an HTTP status."""
++        path = self._directory(snapshot_id) / "COMMITTED.json"
++        manifest = self._load_json(path)
++        if (
++            manifest.get("schema_version") != 1
++            or manifest.get("snapshot_id") != snapshot_id
++        ):
++            raise TokenKVSnapshotError("invalid committed snapshot")
++        raw = path.read_bytes()
++        return {
++            "snapshot_id": snapshot_id,
++            "snapshot_committed": True,
++            "tp_size": manifest["tp_size"],
++            "manifest_ref": {
++                "path": str(path),
++                "sha256": _digest(raw),
++                "bytes": len(raw),
++            },
++        }
+diff --git a/python/sglang/test/test_utils.py b/python/sglang/test/test_utils.py
+index 48e98eb88f..27f8034e9b 100644
+--- a/python/sglang/test/test_utils.py
++++ b/python/sglang/test/test_utils.py
+@@ -239,11 +239,11 @@ def _use_cached_default_models(model_repo: str):
+ 
+ if is_in_ci():
+     DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
+-        10000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 2000
++        10000 + int((os.environ.get("CUDA_VISIBLE_DEVICES") or "0")[0]) * 2000
+     )
+ else:
+     DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
+-        20000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 1000
++        20000 + int((os.environ.get("CUDA_VISIBLE_DEVICES") or "0")[0]) * 1000
+     )
+ DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000}"
+ 
+diff --git a/test/registered/unit/managers/test_token_kv_snapshot.py b/test/registered/unit/managers/test_token_kv_snapshot.py
+new file mode 100644
+index 0000000000..ddfda1f7b3
+--- /dev/null
++++ b/test/registered/unit/managers/test_token_kv_snapshot.py
+@@ -0,0 +1,801 @@
++"""CPU contracts for portable request reconstruction, not a GPU restore test.
++
++The store, reconstruction, batch mutations and input counter methods are real.
++Only device allocation/readback, scheduler collectives and sampling hooks are
++mocked. Run examples/runtime/token_kv_restore.py separately on real engines.
++"""
++
++import copy
++import importlib.util
++import io
++import json
++import tempfile
++import unittest
++from pathlib import Path
++from types import SimpleNamespace as NS
++from unittest.mock import Mock, patch
++
++import torch
++
++from sglang.srt.managers import token_kv_snapshot as snapshot
++from sglang.srt.managers.schedule_batch import ReqKvInfo, ScheduleBatch
++from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
++from sglang.srt.sampling.sampling_params import SamplingParams
++from sglang.test.ci.ci_register import register_cpu_ci
++from sglang.test.test_utils import CustomTestCase
++
++register_cpu_ci(est_time=2, suite="base-a-test-cpu")
++
++
++def cpu_batch(requests, rows):
++    # Native filter/merge run on CPU tensors. No physical KV pool is fabricated.
++    batch = object.__new__(ScheduleBatch)
++    batch.reqs = list(requests)
++    batch.beam_tail = None
++    batch.req_pool_indices = torch.tensor(rows, dtype=torch.int64)
++    batch.req_pool_indices_cpu = batch.req_pool_indices.clone()
++    batch.seq_lens = torch.full((len(rows),), 3, dtype=torch.int64)
++    batch.seq_lens_cpu = batch.seq_lens.clone()
++    batch.orig_seq_lens = batch.seq_lens.to(torch.int32)
++    batch.seq_lens_sum = int(batch.seq_lens.sum())
++    batch.input_ids = batch.out_cache_loc = None
++    batch.model_config = NS(is_encoder_decoder=False)
++    batch.sampling_info = Mock()
++    batch.return_logprob = batch.has_grammar = False
++    batch.return_hidden_states_mode = CaptureHiddenMode.NULL
++    batch.return_hidden_states = batch.is_prefill_only = False
++    batch.multimodal_inputs = [None] * len(rows)
++    batch.spec_info = None
++    return batch
++
++
++class TokenKVSnapshotContracts(CustomTestCase):
++    def setUp(self):
++        self.temp = tempfile.TemporaryDirectory()
++        self.store = snapshot.TokenKVSnapshotStore(self.temp.name)
++        self.identity = dict(
++            weight_version="v0",
++            tp_size=2,
++            kv_dtype="bfloat16",
++            layout="full_attention_and_gdn",
++        )
++        params = SamplingParams(max_new_tokens=8, is_normalized=True)
++        self.metadata = dict(
++            request_schema_version=2,
++            rid="original-source-rid",
++            origin_input_ids=[11, 22],
++            output_ids=[33, 44],
++            computed_tokens=3,
++            origin_input_ids_sha256=snapshot._json_digest([11, 22]),
++            pending_input_token=44,
++            remaining_generation_tokens=6,
++            resolved_sampling_params=snapshot._resolved_sampling_params(params),
++            source_binding=dict(
++                source_engine_instance_id="source-instance", generation=7
++            ),
++            request_flags=dict(return_logprob=True),
++            output_logprobs=[-0.125, -0.25],
++            output_logprob_token_ids=[33, 44],
++            output_weight_versions=[dict(version="v0", start=0, end=2)],
++            temp_scaled_logprobs=False,
++            top_p_normalized_logprobs=False,
++            decode_batch_idx=9,
++            reasoning_state=dict(
++                is_reasoning_over=True, reasoning_tokens=0, think_end_match_len=0
++            ),
++            source_stream_cursors={},
++        )
++        self.state = dict(
++            attention_kv=[torch.arange(4, dtype=torch.float32)],
++            mamba_conv=[torch.zeros(2)],
++            mamba_temporal=[torch.ones(2)],
++        )
++        raw = io.BytesIO()
++        torch.save(self.state, raw)
++        for rank in range(2):
++            self.store.write_rank(
++                "portable",
++                tp_rank=rank,
++                tp_size=2,
++                identity=self.identity,
++                request_metadata=self.metadata,
++                tensor_metadata=snapshot._state_receipt(self.state),
++                payload=raw.getvalue(),
++            )
++        self.store.commit("portable", tp_size=2)
++        self.descriptor = dict(
++            storage_dir=self.temp.name,
++            snapshot_id="portable",
++            identity=copy.deepcopy(self.identity),
++            expected_weight_version="v0",
++            source_binding=copy.deepcopy(self.metadata["source_binding"]),
++            manifest_ref=self.store.receipt("portable")["manifest_ref"],
++        )
++
++    def tearDown(self):
++        self.temp.cleanup()
++
++    def request_input(self, rid="new-target-rid"):
++        return NS(
++            rid=rid,
++            token_kv_restore=copy.deepcopy(self.descriptor),
++            stream=True,
++            text="must be replaced",
++            input_ids=None,
++            input_embeds=None,
++            contains_mm_input=lambda: False,
++            session_params=None,
++            session_id=None,
++            lora_path=None,
++            lora_id=None,
++            custom_logit_processor=None,
++            positional_embed_overrides=None,
++            return_hidden_states=False,
++            return_routed_experts=False,
++            return_indexer_topk=False,
++            return_sampling_mask=False,
++            sampling_logprobs_mode=None,
++        )
++
++    def manager(self, rank=0, running=None):
++        manager = object.__new__(snapshot.TokenKVSnapshotManager)
++        manager.scheduler = NS(ps=NS(tp_rank=rank, tp_size=2), running_batch=running)
++        parallel = patch.object(
++            snapshot,
++            "get_parallel",
++            create=True,
++            return_value=NS(tp_rank=rank, tp_size=2),
++        )
++        parallel.start()
++        self.addCleanup(parallel.stop)
++        manager.engine_instance_id = "fresh-target-instance"
++        manager.resume_metrics, manager.portable_restore_by_rid = {}, {}
++        manager._check_runtime = Mock(return_value=[])
++        manager._drain_overlap_results = Mock()
++        manager._identity = Mock(return_value=copy.deepcopy(self.identity))
++
++        # Actual TP agreement is tested by the real store. No distributed
++        # executor is started in this method-level fixture.
++        def reject(error):
++            if error:
++                raise ValueError(error)
++
++        manager._rank_errors = reject
++
++        def allocate(req, computed, payload, expected):
++            self.assertEqual(computed, 3)
++            self.assertEqual(snapshot._state_receipt(payload), expected)
++            req.req_pool_idx = 10 + rank
++            req.kv.req_pool_idx = req.req_pool_idx
++            return [req.req_pool_idx], expected
++
++        manager._allocate_and_load = Mock(side_effect=allocate)
++        manager._prepare_portable_decode_batch = Mock(
++            side_effect=lambda req, rows, *_: cpu_batch([req], rows)
++        )
++        manager._slots = Mock(return_value=dict(request_row_generation=1))
++        return manager
++
++    def native_request(self, rid="new-target-rid"):
++        return NS(
++            rid=rid,
++            origin_input_ids=[11, 22],
++            sampling_params=snapshot.sampling_params_from_snapshot(
++                self.metadata["resolved_sampling_params"]
++            ),
++            logprob=NS(),
++            req_pool_idx=None,
++            mamba_pool_idx=None,
++            kv=ReqKvInfo(),
++        )
++
++    def test_public_sampling_default_projection(self):
++        metadata = copy.deepcopy(self.metadata)
++        metadata["request_flags"].update(
++            sampling_logprobs_mode="selected",
++            logprob_start_len=2,
++            top_logprobs_num=0,
++            token_ids_logprob=None,
++            require_reasoning=False,
++        )
++        raw = io.BytesIO()
++        torch.save(self.state, raw)
++        for rank in range(2):
++            self.store.write_rank(
++                "selected-default",
++                tp_rank=rank,
++                tp_size=2,
++                identity=self.identity,
++                request_metadata=metadata,
++                tensor_metadata=snapshot._state_receipt(self.state),
++                payload=raw.getvalue(),
++            )
++        self.store.commit("selected-default", tp_size=2)
++        descriptor = copy.deepcopy(self.descriptor)
++        descriptor.update(
++            snapshot_id="selected-default",
++            manifest_ref=self.store.receipt("selected-default")["manifest_ref"],
++        )
++        before = {
++            p.name: p.read_bytes()
++            for p in (Path(self.temp.name) / "selected-default").iterdir()
++            if p.is_file()
++        }
++        obj = self.request_input()
++        obj.token_kv_restore = descriptor
++        with patch.dict("os.environ", {"SGLANG_ENABLE_TOKEN_KV_SNAPSHOT": "1"}):
++            snapshot.prepare_portable_generate_input(obj)
++        self.assertIsNone(obj.sampling_logprobs_mode)
++        self.assertIs(obj.return_sampling_mask, False)
++        self.assertEqual(obj.input_ids, metadata["origin_input_ids"])
++        for key, value in metadata["request_flags"].items():
++            if key != "sampling_logprobs_mode":
++                self.assertEqual(getattr(obj, key), value)
++        self.assertEqual(
++            before,
++            {
++                p.name: p.read_bytes()
++                for p in (Path(self.temp.name) / "selected-default").iterdir()
++                if p.is_file()
++            },
++        )
++
++    def test_public_explicit_sampling_mode_remains_rejected(self):
++        for mode in ("selected", "all"):
++            obj = self.request_input()
++            obj.sampling_logprobs_mode = mode
++            with (
++                self.subTest(mode=mode),
++                patch.dict("os.environ", {"SGLANG_ENABLE_TOKEN_KV_SNAPSHOT": "1"}),
++                self.assertRaisesRegex(ValueError, "explicit sampling_logprobs_mode"),
++            ):
++                snapshot.prepare_portable_generate_input(obj)
++
++    def test_new_rid_reconstruction_preserves_both_tp_histories(self):
++        with patch.dict("os.environ", {"SGLANG_ENABLE_TOKEN_KV_SNAPSHOT": "1"}):
++            obj = self.request_input()
++            snapshot.prepare_portable_generate_input(obj)
++            self.assertEqual(obj.input_ids, [11, 22])
++            self.assertEqual(
++                obj.sampling_params, self.metadata["resolved_sampling_params"]
++            )
++            for invalid_rid in ("original-source-rid", ["target-a", "target-b"]):
++                with (
++                    self.subTest(rid=invalid_rid),
++                    self.assertRaisesRegex(ValueError, "new single target request ID"),
++                ):
++                    snapshot.prepare_portable_generate_input(
++                        self.request_input(invalid_rid)
++                    )
++        for rank in range(2):
++            with self.subTest(tp_rank=rank):
++                manager, req = self.manager(rank), self.native_request()
++                receipt = manager.import_for_generation(req, self.descriptor)
++                self.assertEqual(list(req.output_ids), [33, 44])
++                self.assertEqual(req.logprob.output_token_logprobs_val, [-0.125, -0.25])
++                self.assertEqual(req.logprob.output_token_logprobs_idx, [33, 44])
++                self.assertEqual(
++                    req._token_kv_output_version_spans,
++                    [dict(version="v0", start=0, end=2)],
++                )
++                self.assertEqual(
++                    (receipt["source_rid"], receipt["target_rid"]),
++                    ("original-source-rid", "new-target-rid"),
++                )
++                self.assertEqual(receipt["remaining_generation_tokens"], 6)
++                self.assertEqual(req.sampling_params.max_new_tokens, 8)
++                self.assertEqual(
++                    manager.resume_metrics[req.rid]["actual_input_counter_status"],
++                    "ARMED_NOT_YET_EXECUTED",
++                )
++                self.assertEqual(
++                    manager.resume_metrics[req.rid]["actual_completed_forward_iters"],
++                    [],
++                )
++
++    def test_version_layout_and_history_rejected_before_device_allocation(self):
++        for change in ({"weight_version": "v1"}, {"layout": "different_layout"}):
++            with self.subTest(change=change):
++                manager = self.manager()
++                descriptor = copy.deepcopy(self.descriptor)
++                descriptor["identity"].update(change)
++                with self.assertRaises(ValueError):
++                    manager.import_for_generation(self.native_request(), descriptor)
++                manager._allocate_and_load.assert_not_called()
++        manager, req = self.manager(), self.native_request()
++        req.origin_input_ids = [11, 99]
++        with self.assertRaisesRegex(ValueError, "input differs"):
++            manager.import_for_generation(req, self.descriptor)
++        manager._allocate_and_load.assert_not_called()
++
++    def test_missing_tp_payload_rejected_before_allocation(self):
++        from pathlib import Path
++
++        (Path(self.temp.name) / "portable/rank-1.bin").unlink()
++        manager = self.manager(rank=1)
++        with self.assertRaises(ValueError):
++            manager.import_for_generation(self.native_request(), self.descriptor)
++        manager._allocate_and_load.assert_not_called()
++
++    def test_naturally_empty_target_drops_stale_native_rows(self):
++        old = cpu_batch([self.native_request("finished")], [7])
++        old.filter_batch(keep_indices=[])
++        self.assertTrue(old.is_empty())
++        self.assertEqual(old.seq_lens.numel(), 1)  # Native filter leaves stale rows.
++        imported = cpu_batch([self.native_request()], [10])
++        manager = self.manager(running=old)
++        merged = manager._merge_portable_decode_batch(imported)
++        self.assertIs(merged, imported)
++        self.assertEqual(len(merged.reqs), merged.seq_lens.numel())
++        self.assertEqual(merged.req_pool_indices.tolist(), [10])
++
++    def test_nonempty_target_preserves_existing_member_and_rows(self):
++        old_req = self.native_request("unrelated-active-rid")
++        old_req.output_ids = [71, 72]
++        old_req.logprob.output_token_logprobs_val = [-0.3, -0.4]
++        old = cpu_batch([old_req], [7])
++        imported_req = self.native_request()
++        manager = self.manager(running=old)
++        merged = manager._merge_portable_decode_batch(cpu_batch([imported_req], [10]))
++        self.assertIs(merged, old)
++        self.assertEqual(
++            [req.rid for req in merged.reqs], ["unrelated-active-rid", "new-target-rid"]
++        )
++        self.assertEqual(merged.req_pool_indices.tolist(), [7, 10])
++        self.assertEqual(len(merged.reqs), merged.seq_lens.numel())
++        self.assertEqual(old_req.output_ids, [71, 72])
++        self.assertEqual(old_req.logprob.output_token_logprobs_val, [-0.3, -0.4])
++
++    def test_counter_requires_processed_result_not_initial_zero_or_capture(self):
++        manager, req = self.manager(), self.native_request()
++        manager.import_for_generation(req, self.descriptor)
++        metrics = manager.resume_metrics[req.rid]
++        batch = NS(
++            reqs=[req],
++            seq_lens_cpu=torch.tensor([4]),
++            forward_mode=ForwardMode.DECODE,
++            forward_iter=17,
++        )
++        with patch.object(
++            snapshot, "get_serving", return_value=NS(weight_version="v0")
++        ):
++            intervals = manager.capture_native_input_intervals(batch)
++            self.assertEqual(intervals[0][3:6], (3, 4, 3))
++            batch.seq_lens_cpu[0] = 99  # Overlap may mutate the carrier later.
++            self.assertEqual(intervals[0][3:6], (3, 4, 3))
++            self.assertEqual(
++                metrics["actual_input_counter_status"], "ARMED_NOT_YET_EXECUTED"
++            )
++            manager.observe_native_input_intervals(intervals)
++            manager.observe_native_input_intervals(intervals)
++        self.assertEqual(
++            metrics["actual_input_counter_status"], "OBSERVED_COMPLETED_NATIVE_FORWARD"
++        )
++        self.assertEqual(metrics["actual_recomputed_tokens"], 0)
++        self.assertEqual(metrics["actual_processed_input_tokens"], 1)
++        self.assertEqual(metrics["actual_completed_forward_iters"], [17])
++        with patch.object(
++            snapshot, "get_serving", return_value=NS(weight_version="v1")
++        ):
++            manager.observe_native_input_intervals(intervals)
++        self.assertEqual(metrics["actual_input_counter_status"], "UNAVAILABLE")
++        self.assertIsNone(metrics["actual_recomputed_tokens"])
++        # A real overlap with committed positions must be counted; zero cannot
++        # be a constant stub hidden behind a completed status.
++        other, req = self.manager(), self.native_request("overlap-history-rid")
++        other.import_for_generation(req, self.descriptor)
++        req.prefix_len, req.extend_end = 1, 5  # Current-main native range.
++        req.extend_range = NS(start=1, end=5)  # Pinned older source adapter.
++        batch = NS(reqs=[req], forward_mode=ForwardMode.EXTEND, forward_iter=18)
++        with patch.object(
++            snapshot, "get_serving", return_value=NS(weight_version="v0")
++        ):
++            intervals = other.capture_native_input_intervals(batch)
++            other.observe_native_input_intervals(intervals)
++        self.assertEqual(other.resume_metrics[req.rid]["actual_recomputed_tokens"], 2)
++        self.assertEqual(
++            other.resume_metrics[req.rid]["actual_processed_input_tokens"], 4
++        )
++
++    def test_allocation_keeps_original_native_resource_record_and_mamba_rows(self):
++        manager, req = self.manager(), self.native_request()
++        original_kv = req.kv
++        mamba_row = torch.tensor([9])
++        track_rows = torch.tensor([17, 18])
++
++        def allocate_row(requests):
++            self.assertIs(requests[0].kv, original_kv)
++            req.kv.req_pool_idx = 2
++            req.kv.mamba_pool_idx = mamba_row
++            req.kv.mamba_ping_pong_track_buffer = track_rows
++            return [2]
++
++        pool = NS(
++            alloc=Mock(side_effect=allocate_row),
++            req_to_token=torch.zeros((4, 8), dtype=torch.int32),
++        )
++        allocator = NS(page_size=1, alloc=Mock(return_value=torch.tensor([4, 5, 6])))
++        root, lock = object(), object()
++        cache = NS(
++            disable=False,
++            root_node_handle=Mock(return_value=root),
++            lock=Mock(return_value=lock),
++        )
++        manager.scheduler.req_to_token_pool = pool
++        manager.scheduler.token_to_kv_pool_allocator = allocator
++        manager.scheduler.tree_cache = cache
++        req.extra_key = None
++        req.refresh_fill_ids = Mock()
++        manager._load = Mock()
++        manager._copy = Mock(return_value=self.state)
++        expected = snapshot._state_receipt(self.state)
++        rows, observed = snapshot.TokenKVSnapshotManager._allocate_and_load(
++            manager, req, 3, self.state, expected
++        )
++        self.assertEqual(rows, [2])
++        self.assertEqual(observed, expected)
++        self.assertIs(req.kv, original_kv)
++        self.assertIs(req.kv.mamba_pool_idx, mamba_row)
++        self.assertIs(req.kv.mamba_ping_pong_track_buffer, track_rows)
++        self.assertEqual(pool.req_to_token[2, :3].tolist(), [4, 5, 6])
++        self.assertEqual((req.kv.kv_committed_len, req.kv.kv_allocated_len), (3, 3))
++        self.assertEqual((req.prefix_len, req.extend_end), (3, 3))
++        req.refresh_fill_ids.assert_called_once_with()
++        self.assertIs(req.lock, lock)
++        cache.lock.assert_called_once_with(root)
++        for kv in (
++            ReqKvInfo(req_pool_idx=1),
++            ReqKvInfo(mamba_pool_idx=torch.tensor([1])),
++        ):
++            with self.subTest(holds_kv=kv.holds_kv, holds_mamba=kv.holds_mamba):
++                req.kv = kv
++                pool.alloc.reset_mock()
++                allocator.alloc.reset_mock()
++                with self.assertRaisesRegex(
++                    ValueError, "unowned request resource record"
++                ):
++                    snapshot.TokenKVSnapshotManager._allocate_and_load(
++                        manager, req, 3, self.state, expected
++                    )
++                pool.alloc.assert_not_called()
++                allocator.alloc.assert_not_called()
++
++    def test_release_rejects_changed_allocator_generation_before_any_free(self):
++        manager, req = self.manager(), self.native_request()
++        manager._request = Mock(return_value=(req, cpu_batch([req], [2]), 3, 0))
++        manager._request_metadata = Mock(return_value=copy.deepcopy(self.metadata))
++        manager._slots = Mock(return_value=dict(request_row_generation=8))
++        manager._read = Mock()
++        record = dict(
++            released=False,
++            metadata=copy.deepcopy(self.metadata),
++            slots=dict(request_row_generation=7),
++        )
++        request = NS(
++            source_binding=self.metadata["source_binding"], release_full_gpu_pool=False
++        )
++        with patch.object(snapshot, "release_kv_cache", create=True) as release:
++            with self.assertRaisesRegex(ValueError, "generation changed"):
++                manager._release(request, self.identity, self.store, record)
++            release.assert_not_called()
++        manager._read.assert_not_called()
++        self.assertFalse(record["released"])
++
++    def test_waiting_cancel_uses_native_request_cleanup_not_rid_prefix(self):
++        # Single-rank control-flow contract; distributed agreement is not mocked
++        # into a claim that a TP collective ran.
++        manager, req = self.manager(), self.native_request("exact-waiting-rid")
++        identity = {**self.identity, "tp_size": 1}
++        manager._identity.return_value = identity
++        req.output_ids, req.prefix_len = [], 0
++        req.finished = lambda: False
++        binding = dict(
++            request_id=req.rid,
++            source_engine_instance_id=manager.engine_instance_id,
++            source_execution_generation=7,
++            trajectory_id="trajectory",
++            source_owner_id="owner",
++            source_lease_id="lease",
++            policy_identity_sha256="policy-digest",
++            origin_input_ids_sha256=snapshot._json_digest(req.origin_input_ids),
++        )
++        original = {
++            key: value
++            for key, value in binding.items()
++            if key != "source_engine_instance_id"
++        }
++        original.update(schema_version=1, policy_version="v0")
++        req.sampling_params.custom_params = {
++            "trajectory_source_request_v1": json.dumps(original)
++        }
++        scheduler = manager.scheduler
++        scheduler._engine_paused = True
++        scheduler.running_batch = cpu_batch([], [])
++        scheduler.waiting_queue, scheduler.chunked_req = [req], None
++        scheduler._release_aborted_request = Mock()
++        scheduler.ipc_channels = NS(send_to_tokenizer=NS(send_output=Mock()))
++        manager._drain_overlap_results.return_value = 0
++        request = NS(
++            snapshot_id="pending",
++            storage_dir=self.temp.name,
++            target_rid=req.rid,
++            rid=None,
++            source_binding=binding,
++            identity=identity,
++            expected_weight_version="v0",
++        )
++        with patch.object(
++            snapshot, "get_parallel", return_value=NS(tp_rank=0, tp_size=1)
++        ):
++            result = manager._preempt(request, [])
++        scheduler._release_aborted_request.assert_called_once_with(req)
++        self.assertEqual(scheduler.waiting_queue, [])
++        self.assertEqual(result["source_disposition"], "PENDING_CANCELLED")
++        self.assertTrue(result["pending_removed"])
++        self.assertFalse(result["kv_allocated"])
++
++
++class PublicRestoreEvidenceContracts(CustomTestCase):
++    @classmethod
++    def setUpClass(cls):
++        path = (
++            Path(__file__).resolve().parents[4] / "examples/runtime/token_kv_restore.py"
++        )
++        spec = importlib.util.spec_from_file_location("public_token_kv_restore", path)
++        cls.public = importlib.util.module_from_spec(spec)
++        spec.loader.exec_module(cls.public)
++
++    def test_complete_unique_tp_receipts_required(self):
++        complete = dict(ranks=[dict(tp_rank=i, status="PASS") for i in range(2)])
++        self.assertEqual(set(self.public.rank_rows(complete, 2)), {0, 1})
++        for rows in (
++            [complete["ranks"][0]],
++            [complete["ranks"][0], complete["ranks"][0]],
++            [complete["ranks"][0], dict(tp_rank=2, status="PASS")],
++            [complete["ranks"][0], dict(tp_rank=1, status="FAILED")],
++        ):
++            with self.subTest(rows=rows), self.assertRaises(ValueError):
++                self.public.rank_rows(dict(ranks=rows), 2)
++
++    def test_native_token_logprob_and_version_evidence_must_be_complete(self):
++        row = dict(
++            meta_info=dict(
++                output_token_logprobs=[[-0.125, 33], [-0.25, 44]],
++                weight_version="v0",
++                weight_versions=[dict(version="v0", start=0, end=2)],
++            )
++        )
++        output = self.public.token_output(row)
++        self.assertEqual(output["token_ids"], [33, 44])
++        self.assertEqual(output["logprobs"], [-0.125, -0.25])
++        for changes in (
++            dict(weight_version="v1"),
++            dict(weight_versions=[dict(version="v0", start=0, end=1)]),
++            dict(output_token_logprobs=[[float("nan"), 33], [-0.25, 44]]),
++        ):
++            with self.subTest(changes=changes), self.assertRaises(ValueError):
++                self.public.token_output(
++                    dict(meta_info={**row["meta_info"], **changes})
++                )
++
++
++if __name__ == "__main__":
++    unittest.main()
++
++
++class CapacityLayoutContracts(CustomTestCase):
++    def setUp(self):
++        self.serving = NS(weight_version="v0")
++        self.parallel = NS(tp_size=2, tp_rank=0)
++        for name, value in (
++            ("get_serving", self.serving),
++            ("get_parallel", self.parallel),
++        ):
++            patched = patch.object(snapshot, name, return_value=value)
++            patched.start()
++            self.addCleanup(patched.stop)
++        self.tmp = tempfile.TemporaryDirectory()
++        self.model_dir = Path(self.tmp.name)
++        self.config = {
++            "model_type": "hybrid",
++            "text_config": {
++                "model_type": "qwen3_mamba",
++                "num_hidden_layers": 2,
++                "layer_types": ["mamba", "full_attention"],
++            },
++        }
++        self.config_file = self.model_dir / "config.json"
++        self.config_file.write_text(json.dumps(self.config))
++
++    def tearDown(self):
++        self.tmp.cleanup()
++
++    def _hf_config(self):
++        return NS(to_dict=lambda: copy.deepcopy(self.config), _commit_hash="rev0")
++
++    def _tensor(self, capacity, dtype=torch.float32):
++        return torch.zeros((2, capacity, 3, 4), dtype=dtype)
++
++    def _pool(self, capacity):
++        return NS(
++            mamba_cache=NS(
++                conv=[self._tensor(capacity), self._tensor(capacity)],
++                temporal=self._tensor(capacity),
++            ),
++            mamba_layer_ids=[0],
++        )
++
++    def _allocator(self, page_size=16):
++        return NS(
++            page_size=page_size,
++            _kvcache=NS(full_attention_layer_id_mapping={1: 1}),
++            alloc=Mock(),
++        )
++
++    def _scheduler(self, capacity=461):
++        req_pool = NS(
++            alloc=Mock(),
++            free=Mock(),
++            free_mamba_cache=Mock(),
++            req_to_token=torch.zeros((8, 128), dtype=torch.int32),
++            mamba_pool=self._pool(capacity),
++            req_to_token_pool=None,
++        )
++        return NS(
++            model_config=NS(hf_config=self._hf_config()),
++            server_args=NS(model_path=self.model_dir),
++            token_to_kv_pool_allocator=self._allocator(),
++            req_to_token_pool=req_pool,
++            tree_cache=NS(disable=True),
++        )
++
++    def _manager_for(self, capacity=461):
++        manager = object.__new__(snapshot.TokenKVSnapshotManager)
++        manager.scheduler = self._scheduler(capacity)
++        return manager
++
++    def _identity_with_patches(self, manager):
++        return manager._identity()
++
++    def test_capacity_461_466_identity_and_layout(self):
++        left, right = self._manager_for(461), self._manager_for(466)
++        left_id = self._identity_with_patches(left)
++        right_id = self._identity_with_patches(right)
++        self.assertEqual(left_id, right_id)
++        left._validate_identity(NS(expected_weight_version="v0", identity=right_id))
++        right._validate_identity(NS(expected_weight_version="v0", identity=left_id))
++        self.assertEqual(right._cache_layout()["conv"][0]["shape"][1], 466)
++        full = left._cache_layout()
++        self.assertEqual(full["conv"][0]["shape"][1], 461)
++        self.assertEqual(full["temporal"]["shape"][1], 461)
++        self.assertEqual(left_id["cache_layout"]["conv"][0]["shape"][1], 1)
++        self.assertEqual(left_id["cache_layout"]["temporal"]["shape"][1], 1)
++        self.assertTrue(
++            torch.equal(
++                left.scheduler.req_to_token_pool.mamba_pool.mamba_cache.conv[0],
++                self._tensor(461),
++            )
++        )
++
++    def test_layout_mutations_rejected(self):
++        identity = self._manager_for()._identity()
++        for name in ("conv_dtype", "temporal_dtype", "conv_dim", "temporal_dim"):
++            manager = self._manager_for(466)
++            cache = manager.scheduler.req_to_token_pool.mamba_pool.mamba_cache
++            if name == "conv_dtype":
++                cache.conv[0] = cache.conv[0].to(torch.float64)
++            elif name == "temporal_dtype":
++                cache.temporal = cache.temporal.to(torch.bfloat16)
++            elif name == "conv_dim":
++                cache.conv[0] = torch.zeros((2, 466, 5, 4))
++            else:
++                cache.temporal = torch.zeros((2, 466, 3, 5))
++            with self.subTest(mutation=name), self.assertRaises(ValueError):
++                manager._validate_identity(
++                    NS(expected_weight_version="v0", identity=identity)
++                )
++
++    def test_identity_mismatches_rejected(self):
++        manager = self._manager_for()
++        identity = manager._identity()
++        for key, value in (
++            ("tp_size", 1),
++            ("weight_version", "v1"),
++            ("model_config_sha256", "0" * 64),
++            ("engine_source_sha256", "0" * 64),
++            ("cache_layout_sha256", "0" * 64),
++        ):
++            bad = copy.deepcopy(identity)
++            bad[key] = value
++            with self.subTest(key=key), self.assertRaises(ValueError):
++                manager._validate_identity(
++                    NS(expected_weight_version="v0", identity=bad)
++                )
++        for name in ("page_size", "attention_layers", "mamba_layers", "model_config"):
++            manager = self._manager_for()
++            scheduler = manager.scheduler
++            if name == "page_size":
++                scheduler.token_to_kv_pool_allocator.page_size = 32
++            elif name == "attention_layers":
++                scheduler.token_to_kv_pool_allocator._kvcache.full_attention_layer_id_mapping = {
++                    2: 2
++                }
++            elif name == "mamba_layers":
++                scheduler.req_to_token_pool.mamba_pool.mamba_layer_ids = [9]
++            else:
++                scheduler.model_config.hf_config.to_dict = lambda: {
++                    "model_type": "other"
++                }
++            with self.subTest(actual_mismatch=name), self.assertRaises(ValueError):
++                manager._validate_identity(
++                    NS(expected_weight_version="v0", identity=identity)
++                )
++        self.serving.weight_version = "v1"
++        with self.assertRaisesRegex(ValueError, "weight version"):
++            self._manager_for()._validate_identity(
++                NS(expected_weight_version="v0", identity=identity)
++            )
++
++    def test_native_layout_validation_rejects_malformed_metadata(self):
++        manager = self._manager_for()
++        pool = manager.scheduler.req_to_token_pool.mamba_pool
++        malformed = [torch.zeros((3,)), torch.zeros((2, 0, 3, 4))]
++        for tensor in malformed:
++            with self.subTest(tensor=tensor.shape):
++                pool.mamba_cache.conv[0] = tensor
++                with self.assertRaises(ValueError):
++                    manager._cache_layout()
++        pool.mamba_cache.temporal = torch.zeros((3,))
++        with self.assertRaises(ValueError):
++            manager._cache_layout()
++
++    def test_allocate_and_load_failure_guards(self):
++        manager = self._manager_for()
++        scheduler = manager.scheduler
++        pool, allocator = (
++            scheduler.req_to_token_pool,
++            scheduler.token_to_kv_pool_allocator,
++        )
++        req = NS(
++            kv=NS(
++                holds_kv=False,
++                holds_mamba=False,
++                req_pool_idx=0,
++                kv_committed_len=0,
++                kv_allocated_len=0,
++                cache_protected_len=0,
++                cache_inserted_len=0,
++                mamba_needs_clear=True,
++            ),
++            prefix_len=0,
++            extra_key="x",
++            refresh_fill_ids=Mock(),
++            extend_end=0,
++        )
++        pool.alloc.return_value = None
++        with patch.object(type(manager), "_load", create=True) as load:
++            with self.assertRaises(ValueError):
++                manager._allocate_and_load(req, 4, None, None)
++            load.assert_not_called()
++        self.assertEqual(allocator.alloc.call_count, 0)
++
++        pool.alloc.return_value = [1]
++        allocator.alloc.return_value = None
++        pool.free_mamba_cache.reset_mock()
++        pool.free.reset_mock()
++        with patch.object(type(manager), "_load", create=True) as load:
++            with self.assertRaises(ValueError):
++                manager._allocate_and_load(req, 4, None, None)
++            load.assert_not_called()
++        pool.free_mamba_cache.assert_called_once_with(req)
++        pool.free.assert_called_once_with(req)
++
++        pool.alloc.reset_mock()
++        allocator.alloc.reset_mock()
++        req.kv.holds_mamba = True
++        with patch.object(type(manager), "_load", create=True) as load:
++            with self.assertRaises(ValueError):
++                manager._allocate_and_load(req, 4, None, None)
++            load.assert_not_called()
++            pool.alloc.assert_not_called()
++            allocator.alloc.assert_not_called()
+diff --git a/test/registered/unit/mem_cache/test_token_kv_snapshot_store.py b/test/registered/unit/mem_cache/test_token_kv_snapshot_store.py
+new file mode 100644
+index 0000000000..0d40362b92
+--- /dev/null
++++ b/test/registered/unit/mem_cache/test_token_kv_snapshot_store.py
+@@ -0,0 +1,172 @@
++import hashlib
++import importlib.util
++import json
++import tempfile
++import unittest
++from pathlib import Path
++
++from sglang.test.ci.ci_register import register_cpu_ci
++from sglang.test.test_utils import CustomTestCase
++
++register_cpu_ci(est_time=1, suite="base-a-test-cpu")
++
++
++MODULE = (
++    Path(__file__).resolve().parents[4]
++    / "python/sglang/srt/mem_cache/token_kv_snapshot_store.py"
++)
++spec = importlib.util.spec_from_file_location("token_kv_snapshot_store", MODULE)
++module = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(module)
++Store = module.TokenKVSnapshotStore
++SnapshotError = module.TokenKVSnapshotError
++
++
++class SnapshotStorageTests(CustomTestCase):
++    def setUp(self):
++        self.temporary = tempfile.TemporaryDirectory()
++        self.store = Store(self.temporary.name)
++        self.identity = {
++            "weight_version": "step-7",
++            "model_digest": "actual-model-content-digest",
++            "kv_dtype": "bfloat16",
++            "layout": "full_attention_and_gdn",
++        }
++        self.request = {
++            "input_ids": [11, 22],
++            "output_ids": [33, 44],
++            "computed_token_count": 3,
++            "next_input_token": 44,
++        }
++
++    def tearDown(self):
++        self.temporary.cleanup()
++
++    def write(self, rank=0, size=2, **changes):
++        values = {
++            "tp_rank": rank,
++            "tp_size": size,
++            "identity": self.identity,
++            "request_metadata": self.request,
++            "tensor_metadata": {"components": ["attention_kv", "conv", "recurrent"]},
++            "payload": b"actual-exported-bytes-for-unit-storage-test-" + bytes([rank]),
++        }
++        values.update(changes)
++        return self.store.write_rank("snapshot-1", **values)
++
++    def read(self, rank=0, size=2, **changes):
++        values = {"tp_rank": rank, "tp_size": size, "expected_identity": self.identity}
++        values.update(changes)
++        return self.store.read_rank("snapshot-1", **values)
++
++    def complete(self):
++        self.write()
++        self.write(rank=1)
++        return self.store.commit("snapshot-1", tp_size=2)
++
++    def test_read_requires_all_rank_commit(self):
++        self.write()
++        with self.assertRaises(SnapshotError):
++            self.read()
++        with self.assertRaises(SnapshotError):
++            self.store.commit("snapshot-1", tp_size=2)
++        self.assertFalse(
++            (Path(self.temporary.name) / "snapshot-1/COMMITTED.json").exists()
++        )
++
++    def test_real_file_roundtrip_and_idempotent_commit(self):
++        manifest = self.complete()
++        metadata, payload = self.read(rank=1)
++        self.assertEqual(metadata["request_metadata"], self.request)
++        self.assertTrue(payload.endswith(bytes([1])))
++        self.assertEqual(manifest, self.store.commit("snapshot-1", tp_size=2))
++        self.assertEqual(self.write(rank=1), metadata)
++
++    def test_conflicting_late_write_is_rejected(self):
++        self.complete()
++        with self.assertRaises(SnapshotError):
++            self.write(payload=b"late-mutated-state")
++        self.read()
++
++    def test_tp_ranks_must_agree_on_computed_prefix(self):
++        self.write()
++        self.write(rank=1, request_metadata={**self.request, "computed_token_count": 4})
++        with self.assertRaises(SnapshotError):
++            self.store.commit("snapshot-1", tp_size=2)
++
++    def test_tp_ranks_must_agree_on_model_version(self):
++        self.write()
++        self.write(rank=1, identity={**self.identity, "weight_version": "step-8"})
++        with self.assertRaises(SnapshotError):
++            self.store.commit("snapshot-1", tp_size=2)
++
++    def test_receiver_model_or_dtype_mismatch_is_rejected(self):
++        self.complete()
++        for change in [{"weight_version": "step-8"}, {"kv_dtype": "float8_e4m3fn"}]:
++            with self.assertRaises(SnapshotError):
++                self.read(expected_identity={**self.identity, **change})
++
++    def test_payload_corruption_is_rejected_before_deserialization(self):
++        self.complete()
++        payload = Path(self.temporary.name) / "snapshot-1/rank-0.bin"
++        data = payload.read_bytes()
++        payload.write_bytes(data[:-1] + b"x")
++        with self.assertRaises(SnapshotError):
++            self.read()
++
++    def test_deleted_payload_is_rejected(self):
++        self.complete()
++        (Path(self.temporary.name) / "snapshot-1/rank-1.bin").unlink()
++        with self.assertRaises(SnapshotError):
++            self.read(rank=1)
++
++    def test_metadata_corruption_is_rejected(self):
++        self.complete()
++        path = Path(self.temporary.name) / "snapshot-1/rank-0.json"
++        value = json.loads(path.read_text())
++        value["request_metadata"]["next_input_token"] = 99
++        path.write_text(json.dumps(value))
++        with self.assertRaises(SnapshotError):
++            self.read()
++
++    def test_receiver_request_history_is_bound(self):
++        self.complete()
++        self.read(expected_request_metadata=self.request)
++        with self.assertRaises(SnapshotError):
++            self.read(
++                expected_request_metadata={**self.request, "output_ids": [33, 55]}
++            )
++
++    def test_snapshot_id_cannot_escape_root(self):
++        for value in ["../outside", "/tmp/outside", "a/b", "", "a" * 129]:
++            with self.assertRaises(SnapshotError):
++                self.store._directory(value)
++
++    def test_wrong_world_size_or_rank_is_rejected(self):
++        self.complete()
++        with self.assertRaises(SnapshotError):
++            self.read(size=1)
++        with self.assertRaises(SnapshotError):
++            self.read(rank=2)
++        with self.assertRaises(SnapshotError):
++            self.read(rank=True)
++
++    def test_concurrent_rank_writer_is_rejected(self):
++        self.write()
++        lock = Path(self.temporary.name) / "snapshot-1/rank-0.lock"
++        lock.write_text("")
++        with self.assertRaises(SnapshotError):
++            self.write()
++
++    def test_commit_receipt_binds_actual_manifest_file(self):
++        self.complete()
++        receipt = self.store.receipt("snapshot-1")
++        reference = receipt["manifest_ref"]
++        raw = Path(reference["path"]).read_bytes()
++        self.assertEqual(reference["bytes"], len(raw))
++        self.assertEqual(reference["sha256"], hashlib.sha256(raw).hexdigest())
++        self.assertTrue(receipt["snapshot_committed"])
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -1,0 +1,112 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_megatron_trainer
+  - _self_
+
+async_training:
+
+  # Maximum samples staleness threshold
+  staleness_threshold: 0.1
+
+  # Frequency of parameter synchronization between rollouter and trainer, 
+  # One step means trainer obtains a batch of required samples
+  trigger_parameter_sync_step: 4
+  
+  # The number of ppo_mini_batches that the FullyAsyncTrainer obtains once
+  require_batches: 1
+
+  # When synchronizing parameters, Whether to resume generation when rollout is interrupted.
+  # If True, LLMServerClient auto resume generation, making rollout interruption invisible to the AgentLoop.
+  partial_rollout: True
+  # Retry an incomplete rollout weight publication to the same target version.
+  # Zero preserves the existing fail-fast behavior.
+  weight_publish_max_retries: 0
+  weight_publish_retry_backoff_seconds: 1.0
+
+  # whether to use trainer do_validate
+  use_trainer_do_validate: False
+
+  # VeRL-side transfer intent/admission telemetry. Shadow by default; it
+  # does not imply Mooncake/TENT business-priority enforcement.
+  # Online per-request remote KV restore gate. Keep disabled until calibrated
+  # restore/recompute cost models are available.
+  remote_kv_restore:
+    enforce_request_gate: false
+    # When enforce_request_gate=true, provide restore_model/recompute_model,
+    # safety_margin_s, min_savings_s, and bytes_per_token under cost_gate.
+    # The request gate consumes only the resulting strict bool.
+
+  transfer_admission:
+    enabled: false
+    shadow: true
+    max_inflight_transfers: 4
+    max_inflight_bytes: 536870912
+    max_background_inflight: 1
+    max_records: 10000
+    # Optional telemetry estimate; 0 means unknown.
+    weight_sync_bytes_estimate: 0
+
+  # Persisted metadata handoff for worker/role migration. The snapshot is
+  # stored in the same Mooncake namespace; empty restore_id keeps it off.
+  state_handoff:
+    restore_id: ""
+
+  artifact_data_plane:
+    enabled: false
+    backend: ray_memory
+    accepted_policy_lag: 0
+    lease_timeout_seconds: 300
+    mooncake:
+      namespace: verl/rollout-artifacts/v1
+      local_hostname: ""
+      metadata_server: ""
+      master_server_address: ""
+      protocol: tcp
+      device_name: ""
+      global_segment_size: 536870912
+      local_buffer_size: 134217728
+
+# Rollout config
+rollout:
+
+  # Number of nodes used in the rollout
+  nnodes: 1
+
+  # Number of GPUs per node                     
+  n_gpus_per_node: 8
+
+  # number of responses (i.e. num sample times). > 1 for grpo
+  n: 4
+
+  # total rollout samples # TODO rename to total_rollout_samples
+  total_rollout_steps: 100
+
+data:
+  # Number of samples generated, currently only support 1
+  gen_batch_size: 1
+
+actor_rollout_ref:
+
+  rollout:
+    # Must be enabled! Otherwise, log_probs cannot be calculated.
+    calculate_log_probs: True
+
+    checkpoint_engine:
+      backend: "nccl"
+
+  actor:
+    # Must use rollout log probs for training
+    use_rollout_log_probs: True
+
+  model:
+    # To use remove padding (thd)
+    use_remove_padding: True
+
+# Only then will the use of log probs be correct.
+# And it can be used in conjunction with other rollout_correction algorithms.
+algorithm:
+  rollout_correction:
+    bypass_mode: True

@@ -1,0 +1,300 @@
+{
+  "source_commit": "f91c201d52665b835a92e119b013f36ec9a49c58",
+  "upstream_commit": "acad9875a8bdfc81afbcb0a50d146b2630f44093",
+  "symbols": [
+    {
+      "source_commit": "f91c201d52665b835a92e119b013f36ec9a49c58",
+      "source_file": "verl/experimental/fully_async_policy/rollout_artifact.py",
+      "source_symbol": "_canonical_fingerprint",
+      "source_lines": [
+        67,
+        69
+      ],
+      "source_sha256": "47a77bdf624767e6ea3ad9d5f24b505fdd61a55db639e281e0bf78981b615afb",
+      "destination_file": "identity.py",
+      "destination_symbol": "_canonical_fingerprint",
+      "destination_sha256": "47a77bdf624767e6ea3ad9d5f24b505fdd61a55db639e281e0bf78981b615afb",
+      "change": "verbatim"
+    },
+    {
+      "source_commit": "f91c201d52665b835a92e119b013f36ec9a49c58",
+      "source_file": "verl/experimental/fully_async_policy/rollout_artifact.py",
+      "source_symbol": "CanonicalPolicyKVIdentity",
+      "source_lines": [
+        182,
+        234
+      ],
+      "source_sha256": "036097417d242a44fb1d5315152389a1de3a2275f5eaadc74bfb590d0ddd8387",
+      "destination_file": "identity.py",
+      "destination_symbol": "CanonicalPolicyKVIdentity",
+      "destination_sha256": "036097417d242a44fb1d5315152389a1de3a2275f5eaadc74bfb590d0ddd8387",
+      "change": "verbatim"
+    },
+    {
+      "source_commit": "f91c201d52665b835a92e119b013f36ec9a49c58",
+      "source_file": "verl/experimental/fully_async_policy/rollout_artifact.py",
+      "source_symbol": "_decode_policy_identity",
+      "source_lines": [
+        510,
+        522
+      ],
+      "source_sha256": "465a1da02edde67c9fec0669f08a335778d7cbc5fd9782f21e7c1359379f5ac7",
+      "destination_file": "identity.py",
+      "destination_symbol": "_decode_policy_identity",
+      "destination_sha256": "465a1da02edde67c9fec0669f08a335778d7cbc5fd9782f21e7c1359379f5ac7",
+      "change": "verbatim"
+    },
+    {
+      "source_commit": "f91c201d52665b835a92e119b013f36ec9a49c58",
+      "source_file": "verl/experimental/fully_async_policy/trajectory_snapshot.py",
+      "source_symbol": "canonical_bytes",
+      "source_lines": [
+        17,
+        18
+      ],
+      "source_sha256": "979a6e6d3fd6564f18e5c097c31fc2b6856ce32b2c24a432e1ac61fbc3c3c20a",
+      "destination_file": "snapshot.py",
+      "destination_symbol": "canonical_bytes",
+      "destination_sha256": "979a6e6d3fd6564f18e5c097c31fc2b6856ce32b2c24a432e1ac61fbc3c3c20a",
+      "change": "verbatim"
+    },
+    {
+      "source_commit": "f91c201d52665b835a92e119b013f36ec9a49c58",
+      "source_file": "verl/experimental/fully_async_policy/trajectory_snapshot.py",
+      "source_symbol": "token_digest",
+      "source_lines": [
+        21,
+        22
+      ],
+      "source_sha256": "5891468c07227319009514a6c199817c7d62bf2d1dccde245ec6cd6127e04a54",
+      "destination_file": "snapshot.py",
+      "destination_symbol": "token_digest",
+      "destination_sha256": "5891468c07227319009514a6c199817c7d62bf2d1dccde245ec6cd6127e04a54",
+      "change": "verbatim"
+    },
+    {
+      "source_commit": "f91c201d52665b835a92e119b013f36ec9a49c58",
+      "source_file": "verl/experimental/fully_async_policy/trajectory_snapshot.py",
+      "source_symbol": "TrajectoryOwnerLease",
+      "source_lines": [
+        25,
+        31
+      ],
+      "source_sha256": "5df8d2181f7cb9d7279fdc9823968fb05d2c01966ff39bd5b2b91a0b21525fad",
+      "destination_file": "snapshot.py",
+      "destination_symbol": "TrajectoryOwnerLease",
+      "destination_sha256": "5df8d2181f7cb9d7279fdc9823968fb05d2c01966ff39bd5b2b91a0b21525fad",
+      "change": "verbatim"
+    },
+    {
+      "source_commit": "f91c201d52665b835a92e119b013f36ec9a49c58",
+      "source_file": "verl/experimental/fully_async_policy/trajectory_snapshot.py",
+      "source_symbol": "TrajectorySnapshot",
+      "source_lines": [
+        34,
+        119
+      ],
+      "source_sha256": "7e2ff09cef0b722f0731426a1d8ea96cb202a7cd11dcd9c8166e3700a594d64c",
+      "destination_file": "snapshot.py",
+      "destination_symbol": "TrajectorySnapshot",
+      "destination_sha256": "4439969c713ebe2c7b6751e14621026f2d1402fab54346f5746dbb0985d1f7f9",
+      "change": "import namespace only"
+    },
+    {
+      "source_commit": "f91c201d52665b835a92e119b013f36ec9a49c58",
+      "source_file": "verl/experimental/fully_async_policy/kv_export_proof.py",
+      "source_symbol": "confirm_export",
+      "source_lines": [
+        10,
+        39
+      ],
+      "source_sha256": "09063cba8ca866a3de99a2e92b2a9ceff95e984daf9d55b4ffce97169d66fac2",
+      "destination_file": "kv_export_proof.py",
+      "destination_symbol": "confirm_export",
+      "destination_sha256": "09063cba8ca866a3de99a2e92b2a9ceff95e984daf9d55b4ffce97169d66fac2",
+      "change": "verbatim"
+    },
+    {
+      "source_commit": "f91c201d52665b835a92e119b013f36ec9a49c58",
+      "source_file": "verl/experimental/fully_async_policy/kv_export_proof.py",
+      "source_symbol": "validate_export_reference",
+      "source_lines": [
+        42,
+        67
+      ],
+      "source_sha256": "da1a63ab6c411bd3de41e07a60bec5d13cb88e69fb1aa591ab5d4b0efd4e61a8",
+      "destination_file": "kv_export_proof.py",
+      "destination_symbol": "validate_export_reference",
+      "destination_sha256": "da1a63ab6c411bd3de41e07a60bec5d13cb88e69fb1aa591ab5d4b0efd4e61a8",
+      "change": "verbatim"
+    },
+    {
+      "source_commit": "f91c201d52665b835a92e119b013f36ec9a49c58",
+      "source_file": "verl/experimental/fully_async_policy/preemptible_handoff.py",
+      "source_symbol": "PreemptState",
+      "source_lines": [
+        31,
+        37
+      ],
+      "source_sha256": "3cc8c68c370ea94f524cee058022300eb54fc41af8097de3aae3e13c7b4498b6",
+      "destination_file": "handoff.py",
+      "destination_symbol": "PreemptState",
+      "destination_sha256": "3cc8c68c370ea94f524cee058022300eb54fc41af8097de3aae3e13c7b4498b6",
+      "change": "verbatim"
+    },
+    {
+      "source_commit": "f91c201d52665b835a92e119b013f36ec9a49c58",
+      "source_file": "verl/experimental/fully_async_policy/preemptible_handoff.py",
+      "source_symbol": "_TERMINAL_PREEMPT_STATES",
+      "source_lines": [
+        40,
+        40
+      ],
+      "source_sha256": "29e5430c0654ca46454625c06b45ec235ab7a16e20f792fc2a997faf5eb7b8bd",
+      "destination_file": "handoff.py",
+      "destination_symbol": "_TERMINAL_PREEMPT_STATES",
+      "destination_sha256": "29e5430c0654ca46454625c06b45ec235ab7a16e20f792fc2a997faf5eb7b8bd",
+      "change": "verbatim"
+    },
+    {
+      "source_commit": "f91c201d52665b835a92e119b013f36ec9a49c58",
+      "source_file": "verl/experimental/fully_async_policy/preemptible_handoff.py",
+      "source_symbol": "PreemptionRecord",
+      "source_lines": [
+        43,
+        68
+      ],
+      "source_sha256": "3964a1ffaa0b677abf3992be32c4693255acc2e2d8985158744ea1ec40f020e0",
+      "destination_file": "handoff.py",
+      "destination_symbol": "PreemptionRecord",
+      "destination_sha256": "3964a1ffaa0b677abf3992be32c4693255acc2e2d8985158744ea1ec40f020e0",
+      "change": "verbatim"
+    },
+    {
+      "source_commit": "f91c201d52665b835a92e119b013f36ec9a49c58",
+      "source_file": "verl/experimental/fully_async_policy/preemptible_handoff.py",
+      "source_symbol": "TrajectoryPreemptionTracker",
+      "source_lines": [
+        71,
+        175
+      ],
+      "source_sha256": "d7b34e2e410141a8cbae9157b5032ef55332c44eccaf72cdb47fe3e1445df0bc",
+      "destination_file": "handoff.py",
+      "destination_symbol": "TrajectoryPreemptionTracker",
+      "destination_sha256": "d7b34e2e410141a8cbae9157b5032ef55332c44eccaf72cdb47fe3e1445df0bc",
+      "change": "verbatim"
+    },
+    {
+      "source_commit": "f91c201d52665b835a92e119b013f36ec9a49c58",
+      "source_file": "verl/experimental/fully_async_policy/preemptible_handoff.py",
+      "source_symbol": "HandoffState",
+      "source_lines": [
+        178,
+        182
+      ],
+      "source_sha256": "26f39c66f42828171675a82b967cb21dcc778b882742a8b2efc5d4f0ebcbc177",
+      "destination_file": "handoff.py",
+      "destination_symbol": "HandoffState",
+      "destination_sha256": "26f39c66f42828171675a82b967cb21dcc778b882742a8b2efc5d4f0ebcbc177",
+      "change": "verbatim"
+    },
+    {
+      "source_commit": "f91c201d52665b835a92e119b013f36ec9a49c58",
+      "source_file": "verl/experimental/fully_async_policy/preemptible_handoff.py",
+      "source_symbol": "HandoffManifest",
+      "source_lines": [
+        185,
+        296
+      ],
+      "source_sha256": "6a93c7454815c337f52cf0e1c34ce95aab8903fca65380113e4827665ff95a2e",
+      "destination_file": "handoff.py",
+      "destination_symbol": "HandoffManifest",
+      "destination_sha256": "e2b72b8ba17cd91e320b6124660722351f42ee0e3ae52a968f2cc2904c106eb8",
+      "change": "import namespace only"
+    },
+    {
+      "source_commit": "f91c201d52665b835a92e119b013f36ec9a49c58",
+      "source_file": "verl/experimental/fully_async_policy/preemptible_handoff.py",
+      "source_symbol": "HandoffRecord",
+      "source_lines": [
+        299,
+        317
+      ],
+      "source_sha256": "96cbec12af63181809f70f5ba9811048fc470f1c8d21d65811aed008c103f564",
+      "destination_file": "handoff.py",
+      "destination_symbol": "HandoffRecord",
+      "destination_sha256": "96cbec12af63181809f70f5ba9811048fc470f1c8d21d65811aed008c103f564",
+      "change": "verbatim"
+    },
+    {
+      "source_commit": "f91c201d52665b835a92e119b013f36ec9a49c58",
+      "source_file": "verl/experimental/fully_async_policy/preemptible_handoff.py",
+      "source_symbol": "HandoffManifestRegistry",
+      "source_lines": [
+        320,
+        439
+      ],
+      "source_sha256": "bfba1a1fe889ee675becab3384dfaed57a7f5fdc7868742658be551310a90522",
+      "destination_file": "handoff.py",
+      "destination_symbol": "HandoffManifestRegistry",
+      "destination_sha256": "bfba1a1fe889ee675becab3384dfaed57a7f5fdc7868742658be551310a90522",
+      "change": "verbatim"
+    },
+    {
+      "source_commit": "f91c201d52665b835a92e119b013f36ec9a49c58",
+      "source_file": "verl/experimental/fully_async_policy/preemptible_handoff.py",
+      "source_symbol": "encode_handoff_member_record",
+      "source_lines": [
+        470,
+        485
+      ],
+      "source_sha256": "57feb4b400499e6154162bea4040f29d0fd2ab4f4773dc6c57abd2ce8559d1e8",
+      "destination_file": "handoff.py",
+      "destination_symbol": "encode_handoff_member_record",
+      "destination_sha256": "57feb4b400499e6154162bea4040f29d0fd2ab4f4773dc6c57abd2ce8559d1e8",
+      "change": "verbatim"
+    },
+    {
+      "source_commit": "f91c201d52665b835a92e119b013f36ec9a49c58",
+      "source_file": "verl/experimental/fully_async_policy/preemptible_handoff.py",
+      "source_symbol": "decode_handoff_member_record",
+      "source_lines": [
+        488,
+        501
+      ],
+      "source_sha256": "061b2b52df53308874b32d5dc93102fddcb030b803fb3dc0eb613f0e62789f38",
+      "destination_file": "handoff.py",
+      "destination_symbol": "decode_handoff_member_record",
+      "destination_sha256": "061b2b52df53308874b32d5dc93102fddcb030b803fb3dc0eb613f0e62789f38",
+      "change": "verbatim"
+    },
+    {
+      "source_commit": "f91c201d52665b835a92e119b013f36ec9a49c58",
+      "source_file": "verl/experimental/fully_async_policy/rollout_artifact.py",
+      "source_symbol": "InMemoryRolloutArtifactStore.register_producer",
+      "source_lines": [
+        741,
+        757
+      ],
+      "source_sha256": "122cf55e9381267b7b7badce02d5455efc076a3d9c898c242ac6760461012973",
+      "destination_file": "generation.py",
+      "destination_symbol": "ProducerGenerationRegistry.register_producer",
+      "destination_sha256": "122cf55e9381267b7b7badce02d5455efc076a3d9c898c242ac6760461012973",
+      "change": "verbatim method; storage mapping injected by coordinator"
+    },
+    {
+      "source_commit": "f91c201d52665b835a92e119b013f36ec9a49c58",
+      "source_file": "verl/experimental/fully_async_policy/rollout_artifact.py",
+      "source_symbol": "InMemoryRolloutArtifactStore.get_current_producer_generation",
+      "source_lines": [
+        759,
+        761
+      ],
+      "source_sha256": "c2b2f769378816bade59941ba03c6346ef96dacfe809439d4bdb7a81db0296fb",
+      "destination_file": "generation.py",
+      "destination_symbol": "ProducerGenerationRegistry.get_current_producer_generation",
+      "destination_sha256": "c2b2f769378816bade59941ba03c6346ef96dacfe809439d4bdb7a81db0296fb",
+      "change": "verbatim method; storage mapping injected by coordinator"
+    }
+  ]
+}

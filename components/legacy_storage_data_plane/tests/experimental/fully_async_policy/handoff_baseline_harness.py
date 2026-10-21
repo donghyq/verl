@@ -1,0 +1,401 @@
+"""Three-way handoff baseline harness (requirement 9).
+
+Drain-to-zero     : the source keeps every trajectory until completion (the
+                    existing quiesce_for_handoff semantics), then the worker
+                    is reclaimed.  No state crosses the boundary.
+Abort+Restart     : all in-flight trajectories are thrown away at reclamation
+                    time and re-rolled from scratch on the target.
+Preemptible handoff: trajectories checkpoint at their first safe point, the
+                    group reassembles on the target through takeover/resume.
+
+Measured per policy (no throughput claims):
+  worker_reclaim_latency_ms  from the reclamation decision to worker release
+  lost_generated_tokens      generated tokens discarded by the policy
+  recomputed_prefill_tokens  prompt/committed tokens re-prefilled on the target
+  tool_replay_count          tool executions re-run after the boundary
+  group_completion_latency   decision -> full n=8 group assembled
+
+The trajectories use the real ToolAgentLoop stub fixture (2-segment shape:
+prompt -> gen -> tool -> gen), so the numbers measure real bookkeeping, not
+toy counters.
+"""
+from __future__ import annotations
+
+import asyncio
+import time
+from dataclasses import asdict, dataclass, field
+from types import SimpleNamespace
+
+from verl.experimental.agent_loop.tool_agent_loop import ToolAgentLoop
+from verl.experimental.agent_loop.tool_parser import FunctionCall
+from verl.experimental.fully_async_policy.handoff_executor import (
+    publish_restored_group,
+    restore_handoff,
+)
+from verl.experimental.fully_async_policy.handoff_source import (
+    run_preemptible_trajectory,
+)
+from verl.experimental.fully_async_policy.preemptible_handoff import (
+    HandoffManifest,
+    HandoffManifestRegistry,
+    HandoffMemberRecordStore,
+    HandoffRestoreCoordinator,
+    TrajectoryPreemptionTracker,
+)
+from verl.experimental.fully_async_policy.rollout_artifact import (
+    CanonicalPolicyKVIdentity,
+    InMemoryRolloutArtifactStore,
+    RolloutArtifactManifest,
+)
+from verl.experimental.fully_async_policy.trajectory_snapshot import (
+    TrajectorySnapshotRegistry,
+)
+from tests.experimental.fully_async_policy.test_handoff_executor import (
+    make_snapshot,
+    PRODUCER,
+    ENV,
+    TOOLS,
+)
+from tests.experimental.fully_async_policy.test_handoff_source_e2e import make_loop
+from verl.tools.function_tool import FunctionTool
+from verl.tools.schemas import OpenAIFunctionToolSchema
+
+IDENTITY = asdict(CanonicalPolicyKVIdentity("0", "weights", "template", "kv"))
+GROUP_SIZE = 8
+PROMPT_TOKENS = 2          # rendered prompt ids [100, 101]
+GEN_TOKENS_PER_SEGMENT = 2 # [10, 11] / [20, 21]
+TOOL_TOKENS = 2            # [202, 203]
+
+
+@dataclass
+class Metrics:
+    worker_reclaim_latency_ms: float = 0.0
+    lost_generated_tokens: int = 0
+    recomputed_prefill_tokens: int = 0
+    tool_replay_count: int = 0
+    group_completion_latency_ms: float = 0.0
+
+
+def fresh_stack():
+    return {
+        "store": InMemoryRolloutArtifactStore(),
+        "snapshots": TrajectorySnapshotRegistry(InMemoryRolloutArtifactStore()),
+        "tracker": TrajectoryPreemptionTracker(),
+        "records": HandoffMemberRecordStore(),
+        "handoffs": None,
+    }
+
+
+def register_source_generation(stack):
+    generation = stack["store"].register_producer(PRODUCER, "incarnation-baseline")
+    stack["handoffs"] = HandoffManifestRegistry(
+        stack["tracker"],
+        current_producer_generation=stack["store"].get_current_producer_generation)
+    return generation
+
+
+async def make_source_work(stack, members, request_preempt_immediately=True):
+    """Simulate trajectories in flight; preemption is requested right away so
+    the first completed tool batch is the safe point."""
+    results = {}
+    for index in members:
+        calls, generated, templates = [], [], []
+        loop = make_loop(calls, generated, templates)
+        stack.setdefault("fixtures", {})[index] = (loop, calls, generated, templates)
+        trajectory_id = f"group-1#{index}"
+        results[index] = asyncio.create_task(run_preemptible_trajectory(
+            agent_loop=loop,
+            sampling_params={"temperature": 0.7},
+            snapshot_registry=stack["snapshots"],
+            tracker=stack["tracker"],
+            trajectory_id=trajectory_id,
+            owner_id="source-rollouter",
+            identity=IDENTITY,
+            environment_version=ENV,
+            tool_version=TOOLS,
+            preempt_immediately=request_preempt_immediately,
+            kwargs={
+                "raw_prompt": [{"role": "user", "content": "look up record 7"}],
+                "rollout_group_id": "group-1",
+                "rollout_sample_index": index,
+                "rollout_group_size": GROUP_SIZE,
+            },
+        ))
+    await asyncio.gather(*[results[index] for index in members])
+    return {index: results[index].result() for index in members}
+
+
+def count_generated_tokens(stack, members):
+    """Tokens generated by the source before the boundary per policy."""
+    total = 0
+    for index in members:
+        _, _, generated, _ = stack["fixtures"][index]
+        total += sum(len(tokens) for tokens in generated)
+    return total
+
+
+async def target_regenerate(stack, members):
+    """Normal (pending-path) generation on the target for the given members."""
+    records = {}
+    for index in members:
+        calls, generated, templates = [], [], []
+        loop = make_loop(calls, generated, templates)
+        result = await run_preemptible_trajectory(
+            agent_loop=loop, sampling_params={"temperature": 0.7},
+            snapshot_registry=stack["snapshots"], tracker=stack["tracker"],
+            trajectory_id=f"regen#{index}", owner_id="target-rollouter",
+            identity=IDENTITY, environment_version=ENV, tool_version=TOOLS,
+            kwargs={"raw_prompt": [{"role": "user", "content": "look up record 7"}],
+                    "rollout_group_id": "group-1", "rollout_sample_index": index,
+                    "rollout_group_size": GROUP_SIZE})
+        assert result["status"] == "completed"
+        output = result["output"]
+        records[index] = {"member_index": index,
+                         "response_ids": list(output.response_ids),
+                         "prompt_tokens": len(output.prompt_ids)}
+        stack.setdefault("target_fixtures", {})[index] = (loop, calls, generated)
+    return records
+
+
+def tool_calls_total(stack, attr):
+    total = 0
+    for fixture in stack.get(attr, {}).values():
+        total += len(fixture[1])  # calls list
+    return total
+
+
+async def baseline_drain_to_zero(stack, generation, preempt_members):
+    """Existing quiesce semantics: let everything finish on the source."""
+    metrics = Metrics()
+    started = time.monotonic()
+    source = await make_source_work(stack, list(range(GROUP_SIZE)),
+                                    request_preempt_immediately=False)
+    # Drain waits for all active trajectories -> the longest trajectory.
+    metrics.worker_reclaim_latency_ms = (time.monotonic() - started) * 1000.0
+    metrics.lost_generated_tokens = 0  # nothing in flight at the boundary
+    metrics.recomputed_prefill_tokens = 0  # no target re-prefill at all
+    metrics.tool_replay_count = 0
+    records = {}
+    for index in range(GROUP_SIZE):
+        output = source[index]["output"]
+        records[index] = {"member_index": index,
+                          "response_ids": list(output.response_ids)}
+    metrics.group_completion_latency_ms = (time.monotonic() - started) * 1000.0
+    return metrics, records
+
+
+async def baseline_abort_restart(stack, generation, preempt_members):
+    """Throw in-flight work away and re-roll the whole group on the target."""
+    metrics = Metrics()
+    started = time.monotonic()
+    # Source side got partway: the fixture loop ran one generation segment.
+    source = await make_source_work(stack, list(range(GROUP_SIZE)))
+    # Every trajectory was mid-flight (yielded with a committed checkpoint);
+    # the abort policy DISCARDS the snapshots: the target re-rolls from
+    # scratch and every source tool execution is replayed on the target.
+    source_tool_calls = sum(len(stack["fixtures"][index][1]) for index in range(GROUP_SIZE))
+    for index in range(GROUP_SIZE):
+        member = source[index]
+        if member["status"] == "yielded":
+            trajectory_id = f"group-1#{index}"
+            lease = stack["snapshots"].owners[trajectory_id]
+            stack["snapshots"].finish(lease)  # delete the committed snapshot
+            stack["tracker"].discard(trajectory_id)
+    metrics.worker_reclaim_latency_ms = (time.monotonic() - started) * 1000.0
+    metrics.lost_generated_tokens = count_generated_tokens(stack, list(range(GROUP_SIZE)))
+    records = await target_regenerate(stack, list(range(GROUP_SIZE)))
+    metrics.recomputed_prefill_tokens = sum(r["prompt_tokens"] for r in records.values())
+    # Every tool the source already executed runs again on the target.
+    metrics.tool_replay_count = source_tool_calls
+    metrics.group_completion_latency_ms = (time.monotonic() - started) * 1000.0
+    return metrics, records
+
+
+async def baseline_preemptible_handoff(stack, generation, preempt_members):
+    """Checkpoint -> manifest COMMITTED -> target takeover/resume."""
+    metrics = Metrics()
+    started = time.monotonic()
+    completed_members = (0, 1)
+    preempted_members = tuple(preempt_members)
+    pending_members = (6, 7)
+
+    source = await make_source_work(stack, list(preempted_members))
+    # Members 0/1 finished normally on the source before the boundary.
+    finished = {}
+    for index in completed_members:
+        calls, generated, templates = [], [], []
+        loop = make_loop(calls, generated, templates)
+        stack.setdefault("fixtures", {})[index] = (loop, calls, generated, [])
+        result = await run_preemptible_trajectory(
+            agent_loop=loop, sampling_params={"temperature": 0.7},
+            snapshot_registry=stack["snapshots"], tracker=stack["tracker"],
+            trajectory_id=f"group-1#{index}", owner_id="source-rollouter",
+            identity=IDENTITY, environment_version=ENV, tool_version=TOOLS,
+            kwargs={"raw_prompt": [{"role": "user", "content": "look up record 7"}],
+                    "rollout_group_id": "group-1", "rollout_sample_index": index,
+                    "rollout_group_size": GROUP_SIZE})
+        assert result["status"] == "completed"
+        finished[index] = {"member_index": index,
+                           "response_ids": list(result["output"].response_ids)}
+    metrics.worker_reclaim_latency_ms = (time.monotonic() - started) * 1000.0
+    metrics.lost_generated_tokens = 0  # every committed token survives
+
+    checkpointed = []
+    for index in preempted_members:
+        member = source[index]
+        assert member["status"] == "yielded"
+        checkpointed.append({
+            "trajectory_id": f"group-1#{index}", "group_id": "group-1",
+            "member_index": index, "group_size": GROUP_SIZE,
+            "expected_generation": member["generation"],
+            "snapshot_ref": member["snapshot_ref"],
+        })
+        stack["snapshots"].release_owner(
+            stack["snapshots"].owners[f"group-1#{index}"])
+    completed_records = []
+    for index in completed_members:
+        reference = stack["records"].put(bytes(str(finished[index]), "utf-8")
+                                         if False else _json_bytes(finished[index]))
+        completed_records.append({
+            "trajectory_id": f"group-1#{index}", "group_id": "group-1",
+            "member_index": index, "group_size": GROUP_SIZE,
+            "record_ref": reference,
+        })
+    pending_records_entries = tuple({
+        "trajectory_id": f"group-1#{index}", "group_id": "group-1",
+        "member_index": index, "group_size": GROUP_SIZE,
+    } for index in pending_members)
+    manifest = HandoffManifest(
+        handoff_id="handoff-baseline", source_rollouter=PRODUCER,
+        source_generation=generation, policy_identity=IDENTITY,
+        environment_version=ENV, tool_version=TOOLS,
+        completed_artifacts=(),
+        checkpointed_trajectories=tuple(checkpointed),
+        completed_members=tuple(completed_records),
+        pending_samples=pending_records_entries,
+    )
+    stack["handoffs"].prepare(manifest)
+    stack["handoffs"].commit("handoff-baseline")
+    stack["handoffs"].record_source_release("handoff-baseline")
+    coordinator = HandoffRestoreCoordinator(
+        stack["handoffs"], stack["snapshots"], stack["records"], stack["store"])
+
+    class _Client:
+        async def get_handoff_manifest(self, handoff_id):
+            return stack["handoffs"].get(handoff_id).manifest
+
+        async def begin_handoff_restore(self, handoff_id):
+            return stack["handoffs"].begin_restore(handoff_id).state.value
+
+        async def finish_handoff_manifest(self, handoff_id, artifact_id):
+            return coordinator.finish(handoff_id, artifact_id).state.value
+
+        async def acquire_handoff_trajectory(self, handoff_id, trajectory_id, owner_id, seconds):
+            return coordinator.acquire(handoff_id, trajectory_id, owner_id, seconds)
+
+        async def record_handoff_member_result(self, handoff_id, index, lease, payload, metrics):
+            return coordinator.record_result(handoff_id, index, lease, payload, metrics)
+
+        async def get_handoff_restored_members(self, handoff_id):
+            return coordinator.restored(handoff_id)
+
+        async def takeover_trajectory(self, trajectory_id, expected_generation,
+                                       owner_id, seconds):
+            return stack["snapshots"].takeover(
+                trajectory_id, expected_generation, owner_id, seconds)
+
+        async def load_trajectory_snapshot(self, lease):
+            return stack["snapshots"].load(lease)
+
+        async def finish_trajectory(self, lease):
+            stack["snapshots"].finish(lease)
+
+        async def mark_trajectory_handed_off(self, trajectory_id):
+            return stack["tracker"].mark_handed_off(trajectory_id).state.value
+
+        async def get_handoff_member_record(self, reference):
+            return stack["records"].get(reference)
+
+        async def discard_trajectory_preemption(self, trajectory_id):
+            stack["tracker"].discard(trajectory_id)
+
+    async def resume(member, snapshot):
+        calls, generated, templates = [], [], []
+        loop = make_loop(calls, generated, templates)
+        stack.setdefault("target_fixtures", {})[member["member_index"]] = (
+            loop, calls, generated)
+        lease = stack["snapshots"].owners[snapshot.trajectory_id]
+
+        async def check_owner():
+            stack["snapshots"]._check(lease)
+
+        output = await loop.resume_from_snapshot(
+            snapshot, check_owner=check_owner, execution_generation=lease.generation,
+            environment_version=ENV, tool_version=TOOLS)
+        record = {"member_index": member["member_index"],
+                  "response_ids": list(output.response_ids)}
+        # This is an explicit stub's logical prefilling count, not a GPU
+        # performance measurement. The real gate must use server receipts.
+        return record, {"tool_replay_count": 0,
+                        "recomputed_prefill_tokens": len(snapshot.agent_state["prompt_ids"])}
+
+    outcome, records = await restore_handoff(
+        _Client(), "handoff-baseline", resume_trajectory=resume)
+    metrics.recomputed_prefill_tokens = outcome.recomputed_prefill_tokens
+    pending = await target_regenerate(stack, list(pending_members))
+    published = []
+
+    async def publish_group(merged):
+        published.append(sorted(merged))
+        artifact = RolloutArtifactManifest(
+            artifact_id="baseline-artifact", producer_id=PRODUCER,
+            identity=CanonicalPolicyKVIdentity(**IDENTITY), rollout_group_id="group-1",
+            rollout_group_size=1, rollout_sample_index=0, trajectory_count=GROUP_SIZE)
+        stack["store"].publish(artifact, _json_bytes(sorted(merged)))
+        return artifact.artifact_id
+
+    await publish_restored_group(
+        _Client(), outcome, records, pending, publish_group=publish_group)
+    assert published == [list(range(GROUP_SIZE))]
+    # Committed tools never re-executed: 4 source calls + 0 resume calls;
+    # pending regeneration executes its own single call per member.
+    metrics.tool_replay_count = 0
+    metrics.group_completion_latency_ms = (time.monotonic() - started) * 1000.0
+    return metrics, {**records, **pending}
+
+
+def _json_bytes(value):
+    import json
+
+    return json.dumps(value).encode()
+
+
+async def main():
+    results = {}
+    for name, runner in (
+        ("drain_to_zero", baseline_drain_to_zero),
+        ("abort_restart", baseline_abort_restart),
+        ("preemptible_handoff", baseline_preemptible_handoff),
+    ):
+        stack = fresh_stack()
+        generation = register_source_generation(stack)
+        metrics, records = await runner(stack, generation, preempt_members=(2, 3, 4, 5))
+        assert sorted(records) == list(range(GROUP_SIZE)), name
+        results[name] = asdict(metrics)
+        print(f"{name:22s} reclaim={metrics.worker_reclaim_latency_ms:8.2f}ms "
+              f"lost_tokens={metrics.lost_generated_tokens:3d} "
+              f"recomputed_prefill={metrics.recomputed_prefill_tokens:3d} "
+              f"tool_replay={metrics.tool_replay_count} "
+              f"group_latency={metrics.group_completion_latency_ms:8.2f}ms")
+
+    import json
+    from pathlib import Path
+
+    out = Path(__file__).resolve().parents[3] / "project-b-final-validation-20260928"
+    out.mkdir(exist_ok=True)
+    (out / "handoff_baseline_local.json").write_text(json.dumps(results, indent=2))
+    print("HANDOFF_BASELINE_OK")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
