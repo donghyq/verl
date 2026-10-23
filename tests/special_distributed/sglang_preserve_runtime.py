@@ -375,6 +375,24 @@ async def exercise(model_path, out, tp):
         if len(replica.boundaries) != 1:
             raise RuntimeError("Exactly one observed real update is required")
         before, after = replica.boundaries[0]
+        # Keep the actual observations when a strict validation below rejects.
+        (out / "failure-diagnostics.json").write_text(
+            json.dumps(
+                {
+                    "validation_status": "NOT_YET_VALIDATED",
+                    "prompt_length": len(prompt),
+                    "response_length": len(output.token_ids),
+                    "before": before,
+                    "after": after,
+                    "final": final_native,
+                    "next_native": next_native,
+                    "sender_before": before_sender,
+                    "sender_after": after_sender,
+                },
+                indent=2,
+            )
+            + "\n"
+        )
         rank_receipts = [
             validate(b, a, f, before_sender, after_sender, output, fresh, n, rid)
             for b, a, f, n in zip(before, after, final_native, next_native, strict=True)
