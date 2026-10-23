@@ -70,13 +70,13 @@ def _save_tiny_moe(path):
     torch.manual_seed(17)
     config = Qwen3MoeConfig(
         vocab_size=128,
-        hidden_size=128,
+        hidden_size=256,
         intermediate_size=256,
         moe_intermediate_size=128,
         num_hidden_layers=2,
         num_attention_heads=4,
         num_key_value_heads=2,
-        head_dim=32,
+        head_dim=64,
         num_experts=8,
         num_experts_per_tok=2,
         max_position_embeddings=2048,
