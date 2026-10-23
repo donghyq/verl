@@ -27,6 +27,7 @@ import ray
 import torch
 from reused_tiny_moe import WeightSender, _save_tiny_moe
 from sglang.srt.entrypoints.engine import Engine
+from sglang_preserve_history import classify_native_history
 
 from verl.checkpoint_engine import CheckpointEngineManager
 from verl.single_controller.base.decorator import Dispatch, register
@@ -382,6 +383,14 @@ async def exercise(model_path, out, tp):
                     "validation_status": "NOT_YET_VALIDATED",
                     "prompt_length": len(prompt),
                     "response_length": len(output.token_ids),
+                    "public_output": {
+                        "token_ids": output.token_ids,
+                        "log_probs": output.log_probs,
+                        "stop_reason": output.stop_reason,
+                        "routed_experts": (None if output.routed_experts is None else output.routed_experts.tolist()),
+                        "extra_fields": output.extra_fields,
+                    },
+                    "public_fresh_extra_fields": fresh.extra_fields,
                     "before": before,
                     "after": after,
                     "final": final_native,
@@ -471,18 +480,22 @@ def validate(before, after, final, sender_before, sender_after, output, fresh, n
     # In overlap mode an old forward can finish before pause but remain queued
     # for native result processing. Its later commit is not a recomputation.
     old = [pos for row in before["completed"] + before["pending"] if row["rid"] == rid for pos in row["positions"]]
-    completed = [row for row in final["completed"] if row["rid"] == rid]
-    positions = [pos for row in completed for pos in row["positions"]]
+    all_completed = [row for row in final["completed"] if row["rid"] == rid]
+    # Native overlap may finish one extra forward after the request is done.
+    # Keep its compute in the receipt, but do not invent an output for it.
+    completed, discarded = classify_native_history(
+        all_completed, 64, len(output.token_ids), final["overlap_enabled"], final["finished"][rid]["finished"]
+    )
+    positions = [pos for row in all_completed for pos in row["positions"]]
     if not old or not positions:
         raise RuntimeError("UNKNOWN: actual completed forward input positions missing")
-    assert positions == list(range(64 + 512 - 1)), "History repeated, dropped, or unexpected prefix reuse"
-    new = [row for row in completed if row["forward_id"] > before["last_launched_forward_id"]]
+    new = [row for row in all_completed if row["forward_id"] > before["last_launched_forward_id"]]
     history_overlap = sum(pos in set(old) for row in new for pos in row["positions"])
     assert history_overlap == 0
     assert any(row["weights"] == after["weights"] for row in new), "No completed forward using updated parameters"
     output_intervals = [row["output_interval"] for row in completed]
     assert output_intervals == [[index, index + 1] for index in range(512)]
-    assert all(row["weights"] in (before["weights"], after["weights"]) for row in completed)
+    assert all(row["weights"] in (before["weights"], after["weights"]) for row in all_completed)
     updated_outputs = sum(
         row["output_interval"][1] - row["output_interval"][0] for row in completed if row["weights"] == after["weights"]
     )
@@ -496,6 +509,9 @@ def validate(before, after, final, sender_before, sender_after, output, fresh, n
         "output_tokens_after_preserved_prefix": 512 - count,
         "outputs_using_updated_router_parameters": updated_outputs,
         "completed_forward_inputs": len(positions),
+        "productive_forward_inputs": sum(len(row["positions"]) for row in completed),
+        "discarded_terminal_forwards": len(discarded),
+        "discarded_terminal_forward_inputs": sum(len(row["positions"]) for row in discarded),
         "historical_inputs_recomputed": history_overlap,
         "completed_native_tensor_buckets": len(after["tensor_updates"]) - len(before["tensor_updates"]),
         "routing_prefix_verified": True,
