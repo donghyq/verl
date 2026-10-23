@@ -61,3 +61,27 @@ This is a tiny-MoE smoke test for a mixed-weight in-flight request. It does not
 prove that its suffix equals a fresh request recomputed entirely with the new
 weights, nor cover GDN/Mamba, speculative decoding, DP/PP, LoRA, quantization,
 cross-host movement, business throughput or Trainer integration.
+
+## Recorded validation and remaining checks
+
+The functional portion of a Linux/A100 TP2 run at commit `3fdcd5226` passed:
+one real SGD update, 10 preserved output tokens/logprobs/routing entries and
+502 further outputs. Both native ranks recorded 501 outputs using the updated
+router parameters and zero historical input recomputation. The native overlap
+scheduler completed one additional input after the request finished; it produced
+no output and remains included in the compute count. The same environment ran
+84 public CPU tests with no skips, failures, errors, or CUDA initialization.
+
+That command returned **nonzero** after writing the functional evidence: the
+immediate post-shutdown child-process check rejected four PIDs. Their individual
+states were not recorded. The outer owned-process guard subsequently recorded
+zero remaining tracked descendants. Do not describe this as a complete CLI pass.
+The cleanup follow-up waits for live children and records zombie states using the
+native shutdown resource contract. Four actual CPU child-process lifecycle cases
+pass; the revised cleanup has not been revalidated with a native GPU engine.
+
+The GPU run used a separate frozen dependency snapshot with three explicit,
+retained dependency-audit exceptions (NumPy/mistral-common, absent flash-attn-4,
+and the cuSPARSELt package version). It does not validate the repository's
+unmodified default lock, the documented Docker recipe, or full upstream CI.
+Those checks and human line-by-line review remain pending. AI assistance was used.

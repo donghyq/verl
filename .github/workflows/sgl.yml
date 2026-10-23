@@ -179,7 +179,9 @@ jobs:
         run: |
           CUDA_VISIBLE_DEVICES="" $UV_RUN pytest -q \
             tests/workers/rollout/rollout_sglang/test_preserve_requests_on_cpu.py \
-            tests/workers/rollout/rollout_sglang/test_preserve_kv_weights_on_cpu.py
+            tests/workers/rollout/rollout_sglang/test_preserve_kv_weights_on_cpu.py \
+            tests/workers/rollout/rollout_sglang/test_native_history_on_cpu.py \
+            tests/workers/rollout/rollout_sglang/test_owned_engine_cleanup_on_cpu.py
 
   cleanup:
     runs-on: ubuntu-latest
