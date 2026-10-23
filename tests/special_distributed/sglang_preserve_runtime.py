@@ -28,6 +28,7 @@ import torch
 from reused_tiny_moe import WeightSender, _save_tiny_moe
 from sglang.srt.entrypoints.engine import Engine
 from sglang_preserve_history import classify_native_history
+from sglang_preserve_process import wait_owned_children
 
 from verl.checkpoint_engine import CheckpointEngineManager
 from verl.single_controller.base.decorator import Dispatch, register
@@ -284,13 +285,8 @@ class ObservedServer(SGLangHttpServer):
         return states[0]["preserve_probe"]
 
     async def cleanup_owned_engine(self):
-        import psutil
-
         Engine.shutdown(self)  # Native cleanup affects only this owned Ray actor's children.
-        remaining = [child.pid for child in psutil.Process().children(recursive=True) if child.is_running()]
-        if remaining:
-            raise RuntimeError(f"Owned engine children remain: {remaining}")
-        return {"owned_children_remaining": remaining}
+        return wait_owned_children(timeout=30)
 
 
 class ObservedReplica(SGLangReplica):
