@@ -1,0 +1,58 @@
+--- baseline/native_checkpoint_guard.py
++++ candidate/native_checkpoint_guard.py
+@@ -83,13 +83,50 @@
+         active = _ACTIVE_NATIVE_SAVE.get()
+         if active is None:
+             return self.original.save(value, destination, *args, **kwargs)
++
+         log, fields = active
+-        with observe_call(log, "native_torch_save", destination=str(destination), **fields):
+-            result = self.original.save(value, destination, *args, **kwargs)
++        opt_in = os.environ.get("VERL_P1_BUFFERED_NATIVE_SAVE") == "1"
++
++        eligible = False
++        if opt_in and isinstance(destination, (str, os.PathLike)) and isinstance(fields.get("local_path"), (str, os.PathLike)):
++            rank = fields.get("rank")
++            if type(rank) is int and 0 <= rank <= 3:
++                dest_abs = os.path.abspath(os.fspath(destination))
++                local_abs = os.path.abspath(os.fspath(fields.get("local_path", "")))
++                if os.path.dirname(dest_abs) == local_abs:
++                    fname = os.path.basename(dest_abs)
++                    expected = {
++                        "model_world_size_4_rank_%d.pt" % rank,
++                        "optim_world_size_4_rank_%d.pt" % rank,
++                        "extra_state_world_size_4_rank_%d.pt" % rank,
++                    }
++                    eligible = fname in expected
++
++        if eligible:
++            with observe_call(
++                log,
++                "native_torch_save",
++                destination=str(destination),
++                io_mode="buffered_file",
++                buffer_bytes=16 * 1024 * 1024,
++                **fields,
++            ):
++                with open(destination, "wb", buffering=16 * 1024 * 1024) as stream:
++                    result = self.original.save(value, stream, *args, **kwargs)
++        else:
++            with observe_call(log, "native_torch_save", destination=str(destination), **fields):
++                result = self.original.save(value, destination, *args, **kwargs)
++
+         path = Path(destination)
+-        append_event(log, stage="native_file_size_after_save", status="OBSERVED",
+-                     destination=str(path), bytes=path.stat().st_size if path.is_file() else None,
+-                     native_write_return_is_not_physical_storage_durability_proof=True, **fields)
++        append_event(
++            log,
++            stage="native_file_size_after_save",
++            status="OBSERVED",
++            destination=str(path),
++            bytes=path.stat().st_size if path.is_file() else None,
++            native_write_return_is_not_physical_storage_durability_proof=True,
++            **fields,
++        )
+         return result
+ 
+ 

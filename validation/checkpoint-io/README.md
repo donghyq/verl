@@ -1,0 +1,31 @@
+# Checkpoint writer diagnostic and optional candidate
+
+Run the small CPU probe against an owned writable backing directory and a local
+temporary directory:
+
+```bash
+CUDA_VISIBLE_DEVICES='' python checkpoint_write_probe_three_arm.py OWN_BACKING_DIR LOCAL_TMP_DIR
+```
+
+The three arms save identical 33 MiB CPU state: a filename destination, a
+16 MiB buffered Python file, and a local save followed by a 16 MiB chunked copy.
+The reported write interval includes creation, flush and fsync; readback/value
+validation and cleanup have separate timings. Only this probe's UUID files are removed.
+
+`buffered-native-save.patch` is an opt-in experiment for the existing four-rank
+checkpoint guard, not a general checkpoint backend or an upstream feature patch.
+Its baseline guard SHA is
+`bf615f998c73a3121cd000d739458060735ad6917c0a8a55d266d1f66358ee3e`.
+With `VERL_P1_BUFFERED_NATIVE_SAVE=1`, only the current native save context's
+model, optimizer and extra-state file for that rank uses the buffered file object.
+Original objects, arguments, paths, exceptions and COMPLETE requirements remain.
+The candidate retains the original flush/close behavior and adds no fsync; do not
+infer crash durability from a native save return. Other saves retain their path.
+
+Local Torch 2.11 checks cover real small model/Adam/scheduler/RNG readback, a
+matching subsequent CPU update, aliases/metadata and error propagation without
+retry. They do not establish target Torch 2.13 compatibility, large sharded-state
+peak memory, checkpoint throughput or GPU savings. The patch remains disabled
+until target-environment I/O and full-state validation justify enabling it.
+
+AI assistance was used. Human review, target measurements and deployment are pending.
