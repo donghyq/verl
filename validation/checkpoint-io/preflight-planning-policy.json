@@ -1,0 +1,14 @@
+{
+  "status": "PLANNING_THRESHOLD_NOT_MEASURED_TRAINING_BENEFIT",
+  "workers": 4,
+  "CPU_backing_bytes_each_arm": 268435456,
+  "max_child_peak_RSS_bytes": 3221225472,
+  "min_buffered_MiBps_each_worker": 40,
+  "window_seconds": 360,
+  "observed_model_archive_bytes_each_rank": 35107985746,
+  "estimated_model_plus_Adam_multiplier": 3,
+  "checkpoint_save_reserve_seconds": 3000,
+  "all_workers_must_pass_before_model_load": true,
+  "target_Torch213_execution": "NOT_RUN",
+  "large_FSDP_throughput_guarantee": false
+}

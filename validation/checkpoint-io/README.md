@@ -29,3 +29,12 @@ peak memory, checkpoint throughput or GPU savings. The patch remains disabled
 until target-environment I/O and full-state validation justify enabling it.
 
 AI assistance was used. Human review, target measurements and deployment are pending.
+
+
+## Large-storage preflight
+
+`large_storage_cpu_preflight.py --execute OWN_EXISTING_HDD_DIR` compares the original filename writer with a 16 MiB buffered file, using a 256 MiB CPU backing storage shared by model tensors and views. It verifies alias layout, model/Adam/scheduler/Python+NumPy+Torch RNG restoration and the next actual CPU optimizer update. Each arm runs in a fresh process, records save/fsync and peak RSS, and removes its own UUID file. Default invocation does not run the probe.
+
+The deployment guard requires Linux and the original Torch 2.13.0+cu129 runtime. A development smoke check of the same function body on macOS/Torch 2.11 passed both arms after replacing only the runtime assertion in the test loader; the candidate file was unchanged. This is functional development evidence, not target-runtime I/O performance or distributed FSDP validation.
+
+The companion policy defines a prospective four-worker admission bound before loading the large model. All four workers must pass the state checks and buffered save bound. The 40 MiB/s floor is a planning threshold based on an estimated model-plus-two-Adam-state volume; it is not a measured 35B throughput guarantee or a training-benefit result. Target-runtime execution remains pending. AI assistance was used; the source fallback and review corrections are disclosed in the project records.
