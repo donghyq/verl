@@ -90,6 +90,21 @@
       "raw_files": 12,
       "raw_bytes": 33933602,
       "raw_files_public": false
+    },
+    "prior_published_validation": {
+      "kind": "previously_published_git_snapshot",
+      "head": "94d5efb470a271f6b49f1c8084562cd1460f2f53",
+      "scope": "Previouslypublishedvalidationfiles;thisrecordsitsactualpublicbytes,nottheunexportedprivateruntimeoriginals"
+    },
+    "current_crossweight_gpu_validation": {
+      "kind": "sanitized_validation_report",
+      "source_commit": "82759fc32de300eeefd145f6ef531c7702c4d21b",
+      "raw_archive_sha256": "394ff2ff61c06ce36f5ce980bce2c0227de79eb53a550b2491349d8ea550878e",
+      "archive_files": 49,
+      "raw_files_public": false,
+      "scope": "SyntheticMoEcurrentnativeGPUfunctionalCLIonly",
+      "AI_assisted": true,
+      "human_line_review": "PENDING"
     }
   },
   "files": [
@@ -115,18 +130,18 @@
       "path": "README.md",
       "source": "review_catalog",
       "source_path": "README.md",
-      "source_sha256": "369bdf79551c4e6cce4f6dddf20b8d9d287c4806b6c2ef74213fea2b1777e8bc",
-      "public_sha256": "369bdf79551c4e6cce4f6dddf20b8d9d287c4806b6c2ef74213fea2b1777e8bc",
-      "bytes": 4595,
+      "source_sha256": "4491e07047ddfc82ac87506b41c87af02a692f22c8ccb4001524cc2c220fcfd9",
+      "public_sha256": "4491e07047ddfc82ac87506b41c87af02a692f22c8ccb4001524cc2c220fcfd9",
+      "bytes": 4682,
       "normalizations": []
     },
     {
       "path": "REVIEW_STATUS.md",
       "source": "review_catalog",
       "source_path": "REVIEW_STATUS.md",
-      "source_sha256": "3227cabd2b1102ae02e94ce9da530905cd33e018dc4120a140fb490c202dca73",
-      "public_sha256": "3227cabd2b1102ae02e94ce9da530905cd33e018dc4120a140fb490c202dca73",
-      "bytes": 3974,
+      "source_sha256": "5191d8d689406ed9cc62c1a8159831d8b5c279a4131ef3d1f326a79dc8961d1b",
+      "public_sha256": "5191d8d689406ed9cc62c1a8159831d8b5c279a4131ef3d1f326a79dc8961d1b",
+      "bytes": 4394,
       "normalizations": []
     },
     {
@@ -9347,6 +9362,78 @@
       "normalizations": []
     },
     {
+      "path": "validation/checkpoint-io/README.md",
+      "source": "prior_published_validation",
+      "source_path": "validation/checkpoint-io/README.md",
+      "source_sha256": "a0ee2bc8caffc398f8b3cd12c65f2078701903e062909381979d118e4e7635f1",
+      "public_sha256": "a0ee2bc8caffc398f8b3cd12c65f2078701903e062909381979d118e4e7635f1",
+      "bytes": 3974,
+      "normalizations": []
+    },
+    {
+      "path": "validation/checkpoint-io/buffered-native-save.patch",
+      "source": "prior_published_validation",
+      "source_path": "validation/checkpoint-io/buffered-native-save.patch",
+      "source_sha256": "b323c770221b9459e48ed9f1582186b51a08d39477de1407e4c933de99e80e48",
+      "public_sha256": "b323c770221b9459e48ed9f1582186b51a08d39477de1407e4c933de99e80e48",
+      "bytes": 2696,
+      "normalizations": []
+    },
+    {
+      "path": "validation/checkpoint-io/checkpoint_write_probe_three_arm.py",
+      "source": "prior_published_validation",
+      "source_path": "validation/checkpoint-io/checkpoint_write_probe_three_arm.py",
+      "source_sha256": "698bd0a33ca5ab49b62d33562d3b33a99fe6402b56620af7c50a1f2c00d1cead",
+      "public_sha256": "698bd0a33ca5ab49b62d33562d3b33a99fe6402b56620af7c50a1f2c00d1cead",
+      "bytes": 5005,
+      "normalizations": []
+    },
+    {
+      "path": "validation/checkpoint-io/large_storage_cpu_preflight.py",
+      "source": "prior_published_validation",
+      "source_path": "validation/checkpoint-io/large_storage_cpu_preflight.py",
+      "source_sha256": "f518a22663a3d6e006965de098ded95aa68889ad22ce0a354f702a281929773f",
+      "public_sha256": "f518a22663a3d6e006965de098ded95aa68889ad22ce0a354f702a281929773f",
+      "bytes": 7261,
+      "normalizations": []
+    },
+    {
+      "path": "validation/checkpoint-io/observed-target-runtime-io.json",
+      "source": "prior_published_validation",
+      "source_path": "validation/checkpoint-io/observed-target-runtime-io.json",
+      "source_sha256": "57bf67c0e5158c9ac688465306dd9a83a42f12d414c0d195f67a6e49d338ae0f",
+      "public_sha256": "57bf67c0e5158c9ac688465306dd9a83a42f12d414c0d195f67a6e49d338ae0f",
+      "bytes": 1361,
+      "normalizations": []
+    },
+    {
+      "path": "validation/checkpoint-io/preflight-planning-policy.json",
+      "source": "prior_published_validation",
+      "source_path": "validation/checkpoint-io/preflight-planning-policy.json",
+      "source_sha256": "122d57f3d0fc06ea66a5d15895600688a32246b337fe72f91a0070ab28770274",
+      "public_sha256": "122d57f3d0fc06ea66a5d15895600688a32246b337fe72f91a0070ab28770274",
+      "bytes": 515,
+      "normalizations": []
+    },
+    {
+      "path": "validation/cross-weight-sglang/README.md",
+      "source": "current_crossweight_gpu_validation",
+      "source_path": "validation/cross-weight-sglang/README.md",
+      "source_sha256": "1c6f842c027c561067d9f462f791a8bbee88fd9519a896a98d9112a6ce82c778",
+      "public_sha256": "1c6f842c027c561067d9f462f791a8bbee88fd9519a896a98d9112a6ce82c778",
+      "bytes": 2936,
+      "normalizations": []
+    },
+    {
+      "path": "validation/cross-weight-sglang/observed-native-gpu.json",
+      "source": "current_crossweight_gpu_validation",
+      "source_path": "validation/cross-weight-sglang/observed-native-gpu.json",
+      "source_sha256": "1560c58569ccc296adba085831ed2ba9ba9c0f2d93cb42d429e61f5769b4cd7e",
+      "public_sha256": "1560c58569ccc296adba085831ed2ba9ba9c0f2d93cb42d429e61f5769b4cd7e",
+      "bytes": 1529,
+      "normalizations": []
+    },
+    {
       "path": "validation/r22/README.md",
       "source": "r22_corrected_audit",
       "source_path": "validation/r22/README.md",
@@ -9376,6 +9463,69 @@
       "normalizations": [
         "Apache-2.0 attribution header added"
       ]
+    },
+    {
+      "path": "validation/recovery-cost/README.md",
+      "source": "prior_published_validation",
+      "source_path": "validation/recovery-cost/README.md",
+      "source_sha256": "af21f92e91c3c8428f6505bb7fd44863d934b7192b0f9751a945906651b3cd66",
+      "public_sha256": "af21f92e91c3c8428f6505bb7fd44863d934b7192b0f9751a945906651b3cd66",
+      "bytes": 2425,
+      "normalizations": []
+    },
+    {
+      "path": "validation/recovery-cost/actual_gate_factory.py.txt",
+      "source": "prior_published_validation",
+      "source_path": "validation/recovery-cost/actual_gate_factory.py.txt",
+      "source_sha256": "5aeb67681eb87ee76b28ef5d3356392d5a75a56eb38f6f15619c0284d1d497bd",
+      "public_sha256": "5aeb67681eb87ee76b28ef5d3356392d5a75a56eb38f6f15619c0284d1d497bd",
+      "bytes": 1847,
+      "normalizations": []
+    },
+    {
+      "path": "validation/recovery-cost/first-generation-binding.patch",
+      "source": "prior_published_validation",
+      "source_path": "validation/recovery-cost/first-generation-binding.patch",
+      "source_sha256": "9256e1acf399837951264e2c5f5a10161b72daa93be694e70fc0cee96659579c",
+      "public_sha256": "9256e1acf399837951264e2c5f5a10161b72daa93be694e70fc0cee96659579c",
+      "bytes": 12104,
+      "normalizations": []
+    },
+    {
+      "path": "validation/recovery-cost/first-request-ordering.patch",
+      "source": "prior_published_validation",
+      "source_path": "validation/recovery-cost/first-request-ordering.patch",
+      "source_sha256": "f49d07a4cbda5874a59d98a2112e70b18f16207ef9495d59ef800e964fa05769",
+      "public_sha256": "f49d07a4cbda5874a59d98a2112e70b18f16207ef9495d59ef800e964fa05769",
+      "bytes": 4682,
+      "normalizations": []
+    },
+    {
+      "path": "validation/recovery-cost/native-observation-producers.patch",
+      "source": "prior_published_validation",
+      "source_path": "validation/recovery-cost/native-observation-producers.patch",
+      "source_sha256": "00903d496296ad1ce67f02887b36f5cac97966afad516e3c7ec9685d2cb57bae",
+      "public_sha256": "00903d496296ad1ce67f02887b36f5cac97966afad516e3c7ec9685d2cb57bae",
+      "bytes": 3529,
+      "normalizations": []
+    },
+    {
+      "path": "validation/recovery-cost/same_version_pair.py",
+      "source": "prior_published_validation",
+      "source_path": "validation/recovery-cost/same_version_pair.py",
+      "source_sha256": "034fccb2e688e1e04ec631bc1c0c0f92d6a71588c05919b2cce8b63de146bff2",
+      "public_sha256": "034fccb2e688e1e04ec631bc1c0c0f92d6a71588c05919b2cce8b63de146bff2",
+      "bytes": 4737,
+      "normalizations": []
+    },
+    {
+      "path": "validation/recovery-cost/test_first_request_ordering.py",
+      "source": "prior_published_validation",
+      "source_path": "validation/recovery-cost/test_first_request_ordering.py",
+      "source_sha256": "9d770f9e0bd4528933d49de765c84588b18ff04a190e7d3ea95b42b5ff75ec79",
+      "public_sha256": "9d770f9e0bd4528933d49de765c84588b18ff04a190e7d3ea95b42b5ff75ec79",
+      "bytes": 4004,
+      "normalizations": []
     }
   ],
   "excluded": [
