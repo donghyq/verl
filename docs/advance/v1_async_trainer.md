@@ -67,6 +67,10 @@ actor_rollout_ref:
 
 Custom multi-turn loops can pass `output.extra_fields["cache_salt"]` back as `cache_salt` on later `generate()` calls. Partial-rollout retries preserve it automatically.
 
+SGLang uses the same options with `rollout.name: sglang`. Its initial preservation path supports standalone text replicas with DP=1, PP=1, and complete unquantized weight updates. LoRA (including merged LoRA), delta updates, speculative decoding, multimodal models, and prefill/decode disaggregation retain the existing abort/retry path. TP may span multiple ranks; only the primary server controls the native scheduler.
+
+The SGLang engine pauses with native `in_place` scheduling and loads every weight bucket with `flush_cache=False` and `abort_all_requests=False`. Native SGLang 0.5.20 accepts paused tensor updates directly. Engines exposing both `begin_weight_update` and `end_weight_update` use a complete session instead; a partially available session API or missing preservation controls is rejected before consuming tensors. A failed update must not publish a new global step or resume the paused requests. The native API matrix, GPU behavior, and supported model families need qualification before enabling this option in production.
+
 The KV allocation stays resident during synchronization, so leave space for weight-transfer buffers using `rollout.gpu_memory_utilization` and `rollout.checkpoint_engine.update_weights_bucket_megabytes`. Ordinary memory-pressure preemption can still recompute history. Requests are not migrated to another replica, and their in-memory state does not survive an engine restart.
 
 Partial rollout is part of the V1 async client behavior rather than a V1 configuration switch. When a request is aborted:
