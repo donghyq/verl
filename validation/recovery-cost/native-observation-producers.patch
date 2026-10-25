@@ -1,0 +1,67 @@
+--- baseline/token_kv_snapshot.py
++++ candidate/token_kv_snapshot.py
+@@ -945,9 +945,30 @@
+         return self.portable_restore_by_rid[req.rid]
+ 
+     def capture_native_input_intervals(self, batch):
+-        """Copy physical-import input positions before this actual native forward."""
++        """Copy actual forward intervals; ordinary counting is diagnostic opt-in."""
++        import os
+         rows = []
++        arm = (os.environ.get("VERL_NETCOST_COUNTER_ARM") == "TOKEN_RECOMPUTE")
+         for index, req in enumerate(batch.reqs):
++            if (arm and req.rid not in self.resume_metrics
++                    and isinstance(getattr(req, "origin_input_ids", None), list)
++                    and len(req.origin_input_ids) > 0):
++                self.resume_metrics[req.rid] = {
++                    "counter_mode": "TOKEN_RECOMPUTE",
++                    "physical_import_observed": False,
++                    "counter_cutoff_scope": "all_ordinary_request_input_not_exported_KV_coverage",
++                    "actual_input_counter_status": "ARMED_NOT_YET_EXECUTED",
++                    "committed_prefix_tokens": len(req.origin_input_ids),
++                    "actual_recomputed_tokens": 0,
++                    "actual_processed_input_tokens": 0,
++                    "actual_extend_input_tokens": 0,
++                    "actual_decode_input_tokens": 0,
++                    "resumed_prefill_tokens": 0,
++                    "resumed_decode_input_tokens": 0,
++                    "resumed_forward_batches": 0,
++                    "actual_completed_forward_iters": [],
++                    "resumed_prefill_duration_s": None,
++                }
+             metrics = self.resume_metrics.get(req.rid, {})
+             prefix = metrics.get("committed_prefix_tokens")
+             if type(prefix) is not int:
+--- baseline/token_kv_resume.py
++++ candidate/token_kv_resume.py
+@@ -393,6 +393,14 @@
+         import aiohttp
+         from verl.workers.rollout.sglang_gateway_client import GatewayHTTPResponse, SGLangGatewayClient
+ 
++        def _record_body(payload):
++            observer = getattr(self, "_netcost_raw_body_observer", None)
++            if observer is None:
++                return
++            if not callable(observer):
++                raise ValueError("raw body observer must be callable")
++            observer(deepcopy(payload))
++
+         body = {"rid": request_id, "stream": True, "token_kv_restore": {
+             name: deepcopy(ref[name]) for name in (
+                 "snapshot_id", "storage_dir", "identity", "source_binding", "manifest_ref"
+@@ -412,6 +420,7 @@
+                         continue
+                     value = json.loads(payload)
+                     if value.get("error"):
++                        _record_body(value)
+                         raise ValueError("destination engine returned a stream error")
+                     last = value
+         if not isinstance(last, dict) or not isinstance(last.get("meta_info"), dict):
+@@ -423,6 +432,7 @@
+         actual_ids = [row[1] for row in rows if isinstance(row, (list, tuple)) and len(row) >= 2]
+         if len(actual_ids) != len(rows) or (last.get("output_ids") is not None and last["output_ids"] != actual_ids):
+             raise ValueError("destination token IDs and actual logprobs differ")
++        _record_body(last)
+         # This derives IDs only from actual engine output, preserving raw metadata.
+         value = {**last, "output_ids": actual_ids}
+         output = SGLangGatewayClient._decode_generation(

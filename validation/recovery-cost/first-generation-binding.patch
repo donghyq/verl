@@ -1,0 +1,109 @@
+--- baseline/benefit_native.py
++++ candidate/benefit_native.py
+@@ -4,6 +4,7 @@
+ prepare/phase calls. No Trainer, optimizer, new restore or routing algorithm.
+ """
+ from __future__ import annotations
++from same_version_pair import same_version_requests
+ import asyncio
+ from copy import deepcopy
+ import hashlib
+@@ -295,7 +296,10 @@
+         save(self.root/"source-groups.json", summaries)
+         save(self.root/"source"/"model-counters.json", {"actual_new_model_tokens": self.new_tokens, "events": self.events})
+ 
+-    async def target(self, url, arm):
++    async def target(self, url, arm, *, pair_a_url=None):
++        pair_claimed = pair_completed = False
++        if pair_a_url and (arm != "physical_restore" or self.spec["member_concurrency"] != 1):
++            raise ValueError("pair binding requires original physical restore and serial members; freshness/scheduling are still external")
+         backend = self.native.token_kv_resume.PortableSGLangHTTPBackend(url, timeout_s=180)
+         observe_backend(backend, self.root/"target/recovery-cost-segments.jsonl", source=False)
+         observed = await self.identity(backend)
+@@ -337,17 +341,67 @@
+                         class ObserveNativeFirst:
+                             def __getattr__(self, key): return getattr(wrapped, key)
+                             async def generate(self, *args, **kw):
+-                                output = await wrapped.generate(*args, **kw)
+-                                recovery = output.extra_fields.get("trajectory_token_kv_recovery", {})
+-                                if recovery: record_native_recovery(context.root/"target/recovery-cost-segments.jsonl", recovery)
+-                                if recovery.get("mode") == "PORTABLE_STATE_RESTORED":
+-                                    frame = snapshot.agent_state["extra_fields"][context.native.token_kv_resume.FRAME]
+-                                    context.new_tokens += len(output.token_ids)-len(frame["output_ids"])
+-                                expected = "NATIVE_TOKEN_RECOMPUTE" if arm == "token_recompute" else "PORTABLE_STATE_RESTORED"
+-                                if recovery and recovery.get("mode") != expected: raise ValueError("Actual original recovery branch differs from frozen arm")
+-                                if recovery: save(member_dir/"native-recovery.json", {"actual": recovery,
+-                                    "benchmark_choice": arm, "same_actual_policy": True,
+-                                    "native_reason_field_is_not_used_as_a_policy_change_proof": True})
++                                nonlocal pair_claimed, pair_completed
++                                if getattr(self, '_pair_pending', False): raise ValueError('uncertain pair cannot be retried')
++                                pair_this = bool(pair_a_url and not pair_claimed)
++                                if pair_this:
++                                    pair_claimed = True; self._pair_pending = True
++                                    frame = snapshot.agent_state['extra_fields'][context.native.token_kv_resume.FRAME]
++                                    if (args or kw.get('request_id') != frame['logical_request_id'] or kw.get('prompt_ids') != frame['input_ids'] or kw.get('sampling_params') != frame['requested_sampling_params'] or any(kw.get(k) is not None for k in ('image_data','video_data','audio_data','mm_processor_output'))): raise ValueError('pair differs from saved boundary')
++                                    await check_owner()
++                                    integration.validate_source_exit_binding(death, snapshot.kv_ref['source_binding']['source_engine_instance_id'])
++                                    context.native.token_kv_resume.read_committed_request(snapshot.kv_ref)
++                                    abackend = context.native.token_kv_resume.PortableSGLangHTTPBackend(pair_a_url, timeout_s=180)
++                                    apre, bpre = await context.identity(abackend), await context.identity(backend)
++                                    source_id = snapshot.kv_ref['source_binding']['source_engine_instance_id']
++                                    ids = (apre.get('engine_instance_id'), bpre.get('engine_instance_id'), source_id)
++                                    if (not all(ids) or len(set(ids)) != 3 or pair_a_url.rstrip('/') == url.rstrip('/') or any(v['identity'] != snapshot.kv_ref['identity'] for v in (apre,bpre))): raise ValueError('pair engine identity or instance mismatch')
++                                    for observed_pair in (apre,bpre):
++                                        ranks = observed_pair.get('ranks', [])
++                                        if sorted(r.get('tp_rank') for r in ranks) != [0,1] or any(r.get('resume_metrics_by_rid') or r.get('portable_restore_by_rid') for r in ranks): raise ValueError('pair needs empty observed counter tables; freshness remains unproven')
++                                    save(member_dir/'pair-A-before.json', apre); save(member_dir/'pair-B-before.json', bpre)
++                                    params = deepcopy(frame['requested_sampling_params']); params.pop('max_tokens', None); params.pop('max_new_tokens', None); params['max_tokens'] = frame['remaining_generation_tokens']
++                                    akw = dict(request_id=frame['logical_request_id'], prompt_ids=frame['input_ids']+frame['output_ids'], sampling_params=params)
++                                    ordinary_a = context.transport(pair_a_url, abackend, apre['identity'], check_owner, member_dir/'pair-A')
++                                    ta = time.monotonic(); aoutput = await ordinary_a.generate(**akw); elapsed_a = time.monotonic()-ta
++                                    await check_owner()
++                                    arid = json.loads((member_dir/'pair-A/ordinary-request-001.json').read_text())['native_request_id']
++                                    if len(aoutput.token_ids) > frame['remaining_generation_tokens']: raise ValueError('A exceeds saved remaining budget')
++                                    if context.native.token_kv_resume._actual_attempts(aoutput, snapshot.policy_identity['policy_version'])[-1]['native_meta_info']['id'] != arid: raise ValueError('A native RID differs')
++                                    apost = await abackend.inspect(); save(member_dir/'pair-A-after.json', apost)
++                                    aranks = apost.get('ranks', [])
++                                    if sorted(r.get('tp_rank') for r in aranks) != [0,1]: raise ValueError('A needs both TP ranks')
++                                    ametrics = []; values = []
++                                    for rank in sorted(aranks, key=lambda r:r['tp_rank']):
++                                        metrics = rank.get('resume_metrics_by_rid', {}).get(arid, {})
++                                        value = tuple(metrics.get(k) for k in ('actual_recomputed_tokens','actual_processed_input_tokens','committed_prefix_tokens'))
++                                        if (metrics.get('counter_mode') != 'TOKEN_RECOMPUTE' or metrics.get('physical_import_observed') is not False or metrics.get('actual_input_counter_status') != 'OBSERVED_COMPLETED_NATIVE_FORWARD' or not metrics.get('actual_completed_forward_iters') or any(type(v) is not int or v < 0 for v in value) or value[1] < 1): raise ValueError('A lacks completed native forward metrics')
++                                        ametrics.append(dict(tp_rank=rank['tp_rank'], metrics=deepcopy(metrics))); values.append(value)
++                                    if len(set(values)) != 1: raise ValueError('A TP mirrors disagree; never sum them')
++                                    if getattr(backend, '_netcost_raw_body_observer', None) is not None: raise ValueError('B observer already attached')
++                                    had_observer = hasattr(backend, '_netcost_raw_body_observer'); raw_bodies = []
++                                    backend._netcost_raw_body_observer = lambda body:(raw_bodies.append(deepcopy(body)), save(member_dir/'pair-B-native-raw-body.json', body))
++                                try:
++                                    tb = time.monotonic(); output = await wrapped.generate(*args, **kw); elapsed_b = time.monotonic()-tb
++                                finally:
++                                    if pair_this:
++                                        if had_observer: backend._netcost_raw_body_observer = None
++                                        else: del backend._netcost_raw_body_observer
++                                recovery = output.extra_fields.get('trajectory_token_kv_recovery', {})
++                                if recovery: record_native_recovery(context.root/'target/recovery-cost-segments.jsonl', recovery)
++                                if recovery.get('mode') == 'PORTABLE_STATE_RESTORED':
++                                    frame = snapshot.agent_state['extra_fields'][context.native.token_kv_resume.FRAME]
++                                    context.new_tokens += len(output.token_ids)-len(frame['output_ids'])
++                                expected = 'NATIVE_TOKEN_RECOMPUTE' if arm == 'token_recompute' else 'PORTABLE_STATE_RESTORED'
++                                if recovery and recovery.get('mode') != expected: raise ValueError('Actual original recovery branch differs from frozen arm')
++                                if recovery: save(member_dir/'native-recovery.json', dict(actual=recovery, benchmark_choice=arm, same_actual_policy=True, native_reason_field_is_not_used_as_a_policy_change_proof=True))
++                                if pair_this:
++                                    physical = recovery.get('physical_restore_input_compute', {})
++                                    if recovery.get('mode') != 'PORTABLE_STATE_RESTORED' or physical.get('status') != 'OBSERVED_PHYSICAL_IMPORT_ONLY' or not physical.get('target_rid') or len(raw_bodies) != 1: raise ValueError('B native/raw/counter proof missing')
++                                    plan = same_version_requests(json.loads(snapshot.encode()), bpre['identity'], physical['target_rid'])
++                                    if akw != plan['A_kwargs']: raise ValueError('actual A arguments differ from common snapshot')
++                                    save(member_dir/'pair-first-request.json', dict(scope='SAME_VERSION_REQUEST_FRAGMENT_ONLY', trace_sha256=plan['trace_sha256'], completed_tools_sha256=plan['completed_tools_sha256'], sampling_sha256=plan['sampling_sha256'], A_native_rid=arid, B_native_rid=physical['target_rid'], A_ordinary_generate_s=elapsed_a, B_original_bridge_s=elapsed_b, A_new_tokens=len(aoutput.token_ids), B_new_tokens=len(output.token_ids)-len(frame['output_ids']), A_per_TP=ametrics, B_physical=physical, A_raw_file=str(member_dir/'pair-A/ordinary-native-response-001.json'), B_raw_file=str(member_dir/'pair-B-native-raw-body.json'), empty_tables_are_not_freshness_proof=True, owned_fresh_lifecycle_and_first_request_scheduling='NOT_BOUND', total_platform_allocation='UNKNOWN_FROM_EXECUTOR', whole_window_net_benefit='NOT_MEASURED'))
++                                    pair_completed = True; self._pair_pending = False
+                                 return output
+                         loop.server_manager = ObserveNativeFirst()
+                         async with span(context.root/"target/recovery-cost-segments.jsonl", "retained_history_resume_total", arm=arm):
+@@ -392,6 +446,7 @@
+                     raise ValueError("The actual original group did not contain multi-turn tool work")
+                 save(directory/"complete-group.json", group); groups.append(group)
+             finally: coordinator.close()
++        if pair_a_url and not pair_completed: raise ValueError("requested first-generation pair did not complete")
+         save(self.root/"target-groups.json", groups)
+         save(self.root/"target"/"model-counters.json", {"actual_new_model_tokens": self.new_tokens, "events": self.events})
+ 

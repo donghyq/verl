@@ -1,0 +1,45 @@
+async def make_gate(pair_a_url="owned-A", pair_member_index=2):
+    pair_completed=False
+    if pair_a_url:
+        if pair_member_index is None:
+            raise ValueError("pair_a_url requires pair_member_index")
+        if type(pair_member_index) is not int or not (0 <= pair_member_index <= 7):
+            raise ValueError("pair_member_index must be an int in 0..7")
+    pair_ready = asyncio.get_running_loop().create_future() if pair_a_url else None
+    @asynccontextmanager
+    async def pair_turn(index, snapshot):
+        if pair_ready is None or pair_ready.done():
+            if pair_ready is not None:
+                pair_ready.result()
+            yield
+            return
+        if index == pair_member_index:
+            if snapshot is None or not snapshot.kv_ref:
+                error = ValueError("pair member lacks a committed snapshot kv_ref")
+                if not pair_ready.done():
+                    pair_ready.set_exception(error)
+                raise error
+            try:
+                yield
+            except BaseException as error:
+                if not pair_ready.done():
+                    pair_ready.set_exception(error)
+                raise
+            if not pair_completed:
+                error = RuntimeError("pair member finished without pair generation success")
+                if not pair_ready.done():
+                    pair_ready.set_exception(error)
+                raise error
+            if not pair_ready.done():
+                pair_ready.set_result(None)
+        else:
+            await asyncio.shield(pair_ready)
+            pair_ready.result()
+            yield
+
+    def finish():
+        nonlocal pair_completed
+        pair_completed=True
+        if pair_ready is not None and not pair_ready.done():
+            pair_ready.set_result(None)
+    return pair_turn,finish,pair_ready

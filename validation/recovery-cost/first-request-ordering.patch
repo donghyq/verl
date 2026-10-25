@@ -1,0 +1,75 @@
+--- a/benefit_native.py
++++ b/benefit_native.py
+@@ -6,6 +6,7 @@
+ from __future__ import annotations
+ from same_version_pair import same_version_requests
+ import asyncio
++from contextlib import asynccontextmanager
+ from copy import deepcopy
+ import hashlib
+ import importlib
+@@ -296,7 +297,45 @@
+         save(self.root/"source-groups.json", summaries)
+         save(self.root/"source"/"model-counters.json", {"actual_new_model_tokens": self.new_tokens, "events": self.events})
+ 
+-    async def target(self, url, arm, *, pair_a_url=None):
++    async def target(self, url, arm, *, pair_a_url=None, pair_member_index=None):
++        if pair_a_url:
++            if pair_member_index is None:
++                raise ValueError("pair_a_url requires pair_member_index")
++            if type(pair_member_index) is not int or not (0 <= pair_member_index <= 7):
++                raise ValueError("pair_member_index must be an int in 0..7")
++        pair_ready = asyncio.get_running_loop().create_future() if pair_a_url else None
++
++        @asynccontextmanager
++        async def pair_turn(index, snapshot):
++            if pair_ready is None or pair_ready.done():
++                if pair_ready is not None:
++                    pair_ready.result()
++                yield
++                return
++            if index == pair_member_index:
++                if snapshot is None or not snapshot.kv_ref:
++                    error = ValueError("pair member lacks a committed snapshot kv_ref")
++                    if not pair_ready.done():
++                        pair_ready.set_exception(error)
++                    raise error
++                try:
++                    yield
++                except BaseException as error:
++                    if not pair_ready.done():
++                        pair_ready.set_exception(error)
++                    raise
++                if not pair_completed:
++                    error = RuntimeError("pair member finished without pair generation success")
++                    if not pair_ready.done():
++                        pair_ready.set_exception(error)
++                    raise error
++                if not pair_ready.done():
++                    pair_ready.set_result(None)
++            else:
++                await asyncio.shield(pair_ready)
++                pair_ready.result()
++                yield
++
+         pair_claimed = pair_completed = False
+         if pair_a_url and (arm != "physical_restore" or self.spec["member_concurrency"] != 1):
+             raise ValueError("pair binding requires original physical restore and serial members; freshness/scheduling are still external")
+@@ -314,7 +353,7 @@
+             coordinator, runtime = self.runtime(directory/"durable", "target-"+uuid4().hex)
+             receipts = {}
+             async def execute(index, original, lease, check_owner, snapshot=None):
+-                async with semaphore:
++                async with pair_turn(index, snapshot), semaphore:
+                     member_dir = directory/"target"/str(index)
+                     ordinary = self.transport(url, backend, observed["identity"], check_owner, member_dir)
+                     loop = self.sampler.loop(ordinary)
+@@ -402,6 +441,8 @@
+                                     if akw != plan['A_kwargs']: raise ValueError('actual A arguments differ from common snapshot')
+                                     save(member_dir/'pair-first-request.json', dict(scope='SAME_VERSION_REQUEST_FRAGMENT_ONLY', trace_sha256=plan['trace_sha256'], completed_tools_sha256=plan['completed_tools_sha256'], sampling_sha256=plan['sampling_sha256'], A_native_rid=arid, B_native_rid=physical['target_rid'], A_ordinary_generate_s=elapsed_a, B_original_bridge_s=elapsed_b, A_new_tokens=len(aoutput.token_ids), B_new_tokens=len(output.token_ids)-len(frame['output_ids']), A_per_TP=ametrics, B_physical=physical, A_raw_file=str(member_dir/'pair-A/ordinary-native-response-001.json'), B_raw_file=str(member_dir/'pair-B-native-raw-body.json'), empty_tables_are_not_freshness_proof=True, owned_fresh_lifecycle_and_first_request_scheduling='NOT_BOUND', total_platform_allocation='UNKNOWN_FROM_EXECUTOR', whole_window_net_benefit='NOT_MEASURED'))
+                                     pair_completed = True; self._pair_pending = False
++                                    if pair_ready is not None and not pair_ready.done():
++                                        pair_ready.set_result(None)
+                                 return output
+                         loop.server_manager = ObserveNativeFirst()
+                         async with span(context.root/"target/recovery-cost-segments.jsonl", "retained_history_resume_total", arm=arm):
