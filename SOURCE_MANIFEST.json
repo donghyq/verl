@@ -82,6 +82,14 @@
       "kind": "CPU_simulation",
       "production_benefit": "NOT_MEASURED",
       "mainline_priority": "PAUSED"
+    },
+    "r22_corrected_audit": {
+      "kind": "offline_independent_audit_from_actual_raw_receipts",
+      "scope": "generic_observer_corrections_not_deployed_GPU_revision",
+      "raw_archive_sha256": "70c2d82dbd2dc06da732097a16318a99469b18ca8d899f8fdf3f0bb77bf0a55c",
+      "raw_files": 12,
+      "raw_bytes": 33933602,
+      "raw_files_public": false
     }
   },
   "files": [
@@ -107,18 +115,18 @@
       "path": "README.md",
       "source": "review_catalog",
       "source_path": "README.md",
-      "source_sha256": "f2877a22032951b3e53a484778dbcb015c237ff40d8d02f9773d14e877290bbb",
-      "public_sha256": "f2877a22032951b3e53a484778dbcb015c237ff40d8d02f9773d14e877290bbb",
-      "bytes": 4457,
+      "source_sha256": "369bdf79551c4e6cce4f6dddf20b8d9d287c4806b6c2ef74213fea2b1777e8bc",
+      "public_sha256": "369bdf79551c4e6cce4f6dddf20b8d9d287c4806b6c2ef74213fea2b1777e8bc",
+      "bytes": 4595,
       "normalizations": []
     },
     {
       "path": "REVIEW_STATUS.md",
       "source": "review_catalog",
       "source_path": "REVIEW_STATUS.md",
-      "source_sha256": "c4400eda9068c9df5046ead13b7ac3589a12de158cc674f440e63904b7198ceb",
-      "public_sha256": "c4400eda9068c9df5046ead13b7ac3589a12de158cc674f440e63904b7198ceb",
-      "bytes": 3667,
+      "source_sha256": "3227cabd2b1102ae02e94ce9da530905cd33e018dc4120a140fb490c202dca73",
+      "public_sha256": "3227cabd2b1102ae02e94ce9da530905cd33e018dc4120a140fb490c202dca73",
+      "bytes": 3974,
       "normalizations": []
     },
     {
@@ -3837,9 +3845,11 @@
       "source": "joint_functional_core_r14",
       "source_path": "tests/utils/test_rl_insight_logger_on_cpu.py",
       "source_sha256": "0846c5736ba84f4c38e9e1abbbd90ec2945a46abf712deb3424a550de1850f06",
-      "public_sha256": "0846c5736ba84f4c38e9e1abbbd90ec2945a46abf712deb3424a550de1850f06",
-      "bytes": 6545,
-      "normalizations": []
+      "public_sha256": "7bb9f4b407c86174798b614175c4f7daae8ddc12f2548974677530c42fd0c371",
+      "bytes": 6376,
+      "normalizations": [
+        "Git normalized CRLF source to LF on initial publication; public bytes now recorded"
+      ]
     },
     {
       "path": "runtime/verl/tests/utils/test_rollout_trace_on_cpu.py",
@@ -5791,9 +5801,11 @@
       "source": "joint_functional_core_r14",
       "source_path": "verl/models/transformers/npu_patch.py",
       "source_sha256": "b3b138e228427b5d8f1cea92e82e9290be0259a236167d79e81a9ed4a8bdd4b6",
-      "public_sha256": "b3b138e228427b5d8f1cea92e82e9290be0259a236167d79e81a9ed4a8bdd4b6",
-      "bytes": 26159,
-      "normalizations": []
+      "public_sha256": "ba7f7fa51d158df7ac68c1a52429cc573ba7cc54904cb190b3ada67c911c6521",
+      "bytes": 25570,
+      "normalizations": [
+        "Git normalized CRLF source to LF on initial publication; public bytes now recorded"
+      ]
     },
     {
       "path": "runtime/verl/verl/models/transformers/qwen2.py",
@@ -7969,9 +7981,11 @@
       "source": "joint_functional_core_r14",
       "source_path": "verl/utils/reward_score/search_r1_like_qa_em.py",
       "source_sha256": "8070e4d07719f23e626968b983c597918c73d15c6ab5b09c5346e7311d0cac83",
-      "public_sha256": "8070e4d07719f23e626968b983c597918c73d15c6ab5b09c5346e7311d0cac83",
-      "bytes": 5338,
-      "normalizations": []
+      "public_sha256": "aea401d7386398a5465256a6b7b816d0d0a088359fd8c840699b1bf83d837701",
+      "bytes": 5182,
+      "normalizations": [
+        "Git normalized CRLF source to LF on initial publication; public bytes now recorded"
+      ]
     },
     {
       "path": "runtime/verl/verl/utils/rollout_trace.py",
@@ -9331,6 +9345,37 @@
       "public_sha256": "de753179f34fcfff6396e1576589cc52d1564f69ca6eb7eadd3242d8dfdad5f9",
       "bytes": 29627,
       "normalizations": []
+    },
+    {
+      "path": "validation/r22/README.md",
+      "source": "r22_corrected_audit",
+      "source_path": "validation/r22/README.md",
+      "source_sha256": "6cc82bd17b6834421e4be4cb83bf8495060416781c66fad3783d162a4ead5691",
+      "public_sha256": "6cc82bd17b6834421e4be4cb83bf8495060416781c66fad3783d162a4ead5691",
+      "bytes": 2871,
+      "normalizations": []
+    },
+    {
+      "path": "validation/r22/complete_native_inventory.py",
+      "source": "r22_corrected_audit",
+      "source_path": "validation/r22/complete_native_inventory.py",
+      "source_sha256": "63f1bd5d94b2adaa67f361de105e9b72b7578eb7cbc294e1b883071a7a227a04",
+      "public_sha256": "15a5455d577475aaf9afc4e82011b3eba9174adce5ec681d4e8059e0839d1df5",
+      "bytes": 1909,
+      "normalizations": [
+        "Apache-2.0 attribution header added"
+      ]
+    },
+    {
+      "path": "validation/r22/native_handoff_timeline.py",
+      "source": "r22_corrected_audit",
+      "source_path": "validation/r22/native_handoff_timeline.py",
+      "source_sha256": "be87b67f974e5ba76e617b607004b422cfe9b65bd9ac2cb9bb9cc5434c40d2c4",
+      "public_sha256": "ab4bfe9e1e917b8e3ada028476d7ee7474e47c555ebb50570ee6b6dfbcfd5ca1",
+      "bytes": 1438,
+      "normalizations": [
+        "Apache-2.0 attribution header added"
+      ]
     }
   ],
   "excluded": [

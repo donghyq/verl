@@ -6,9 +6,9 @@
 
 | 要审阅的内容 | 入口 | 当前边界 |
 | --- | --- | --- |
-| VeRL：SGLang 请求在权重更新期间保留与恢复 | [干净的功能分支](https://github.com/donghyq/verl/tree/codex/sglang-preserve-weight-update)、[仅本功能的差异](https://github.com/donghyq/verl/compare/432eb05fcc2bc4a0ce1bff13a3a5c3b35d1cb77b...2f4bb6c0ffbf5418b2d12ebd00897e4e93b9fe59)、[本分支源码副本](upstream/verl/) | 基于 #8273 公共接口；CPU 方法级检查和发布检查已过，完整 Linux 环境及真实权重更新 GPU 验证待做。尚未提交 VeRL PR |
+| VeRL：SGLang 请求在权重更新期间保留与恢复 | [干净的功能分支](https://github.com/donghyq/verl/tree/codex/sglang-preserve-weight-update)、[仅本功能的差异](https://github.com/donghyq/verl/compare/432eb05fcc2bc4a0ce1bff13a3a5c3b35d1cb77b...f3a8c3b4c607938ee7fff829d519643742909a01)、[本分支源码副本](upstream/verl/) | 基于 #8273 公共接口；真实 SGD / TP2 原请求继续生成与历史零重算已有 GPU 证据；[fork 审阅 Draft #1](https://github.com/donghyq/verl/pull/1) 已创建。当前默认锁定环境 CI 与人审待完成 |
 | SGLang：活跃请求的同版本跨进程恢复 | [已有 Draft PR #45572](https://github.com/sgl-project/sglang/pull/45572)、[已推送版本的源码副本](upstream/sglang/) | 现有 PR 保留。历史固定版本的 GPU 恢复结果与当前公开 PR 版本分别记录，不能混用 |
-| 原生异步训练使用的轨迹、缓存、完整样本组交付与版本隔离 | [轨迹状态模块](runtime/verl/verl/trainer/ppo/v1/trajectory_state/)、[训练队列连接](runtime/verl/verl/trainer/ppo/v1/agent_loop_tq.py)、[训练入口](runtime/verl/verl/trainer/ppo/v1/trainer_separate_async.py) | 保留完整源码快照以便追踪调用；统一 35B 验收尚未完成 |
+| 原生异步训练使用的轨迹、缓存、完整样本组交付与版本隔离 | [轨迹状态模块](runtime/verl/verl/trainer/ppo/v1/trajectory_state/)、[训练队列连接](runtime/verl/verl/trainer/ppo/v1/agent_loop_tq.py)、[训练入口](runtime/verl/verl/trainer/ppo/v1/trainer_separate_async.py) | 保留完整源码快照以便追踪调用；原 35B 统一功能链已据原件独立审计，见[详细证据](validation/r22/README.md) |
 | 可靠产物存储、Mooncake 载荷、处理租约及传输成本 | [历史存储与数据面组件](components/legacy_storage_data_plane/)、[独立租约恢复组件](components/lease_recovery/) | 与当前原生训练快照分开。不能把 Mooncake SDK/组件验证说成当前 35B 数据面已使用 Mooncake |
 | 物理缓存接管、训练更新和源 GPU 复用的检查 | [原生训练与观测代码](runtime/native/native-training/)、[生产 SGLang 恢复扩展](runtime/sglang/) | 功能路径和观测路径并列；检查器存在不代表其验收条件已经通过 |
 | 完整训练 Checkpoint 与恢复净成本 | [保存与加载候选](candidates/checkpoint/)、[成本统计候选](candidates/recovery_net_cost/) | 保存模型、优化器和训练进度的完整 3→4 恢复待验证；没有有效、工作量等价的收益结论 |
