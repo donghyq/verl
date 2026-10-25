@@ -37,4 +37,11 @@ AI assistance was used. Human review, target measurements and deployment are pen
 
 The deployment guard requires Linux and the original Torch 2.13.0+cu129 runtime. A development smoke check of the same function body on macOS/Torch 2.11 passed both arms after replacing only the runtime assertion in the test loader; the candidate file was unchanged. This is functional development evidence, not target-runtime I/O performance or distributed FSDP validation.
 
-The companion policy defines a prospective four-worker admission bound before loading the large model. All four workers must pass the state checks and buffered save bound. The 40 MiB/s floor is a planning threshold based on an estimated model-plus-two-Adam-state volume; it is not a measured 35B throughput guarantee or a training-benefit result. Target-runtime execution remains pending. AI assistance was used; the source fallback and review corrections are disclosed in the project records.
+The companion policy defines a prospective four-worker admission bound before loading the large model. All four workers must pass the state checks and buffered save bound. The 40 MiB/s floor is a planning threshold based on an estimated model-plus-two-Adam-state volume; it is not a measured 35B throughput guarantee or a training-benefit result. Target-runtime evidence is recorded below. AI assistance was used; the source fallback and review corrections are disclosed in the project records.
+
+
+## Target-runtime result
+
+The first completed target-worker preflight used Torch 2.13.0+cu129 and the exact 256 MiB probe above. Filename saving took 47.62 s (5.38 MiB/s); the 16 MiB buffered writer took 48.36 s (5.29 MiB/s), including flush/fsync/close. Both preserved the CPU state, alias layout and next optimizer update. Buffering did not improve the observed write rate and failed the fixed 40 MiB/s planning gate.
+
+Only one worker produced a complete CPU record; the other three records are UNKNOWN. The training application stopped before large-model loading, so this result provides no FSDP/full-checkpoint recovery or training-benefit claim. The next control separates local serialization from 16 MiB chunked copying to the target path and records process CPU time. See `observed-target-runtime-io.json`; no real business input or internal host/path is included.

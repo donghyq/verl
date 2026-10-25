@@ -1,0 +1,36 @@
+{
+  "status": "BUFFERED_CANDIDATE_DID_NOT_MEET_IO_PLANNING_GATE",
+  "scope": "one complete CPU serialization preflight on a GPU worker, not FSDP throughput or training benefit",
+  "source_sha256": "f518a22663a3d6e006965de098ded95aa68889ad22ce0a354f702a281929773f",
+  "actual_torch": "2.13.0+cu129",
+  "cuda_initialized": false,
+  "actual_cuda_runtime_version": null,
+  "actual_backing_bytes": 268435456,
+  "complete_rank_records": 1,
+  "other_three_ranks": "UNKNOWN_MISSING_MARKER",
+  "arms": [
+    {
+      "arm": "path",
+      "archive_bytes": 268452404,
+      "total_save_with_flush_fsync_close_s": 47.62032651063055,
+      "MiB_per_s": 5.376195033336501,
+      "CPU_alias_layout_values_equal": true,
+      "next_CPU_model_Adam_scheduler_RNG_update_equal": true
+    },
+    {
+      "arm": "buffer16MiB",
+      "archive_bytes": 268451481,
+      "total_save_with_flush_fsync_close_s": 48.363134807907045,
+      "MiB_per_s": 5.293603974345014,
+      "CPU_alias_layout_values_equal": true,
+      "next_CPU_model_Adam_scheduler_RNG_update_equal": true
+    }
+  ],
+  "owned_UUID_files_removed": true,
+  "min_buffered_MiBps_planning_gate": 40,
+  "large_model_load_started": false,
+  "checkpoint3_to_newprocess_update4": "NOT_ACCEPTED",
+  "underlying_bottleneck": "UNKNOWN_CPU_VS_IO_WAIT_NEXT_CONTROL",
+  "paired_repetitions": 1,
+  "statistical_speedup_claim": false
+}
