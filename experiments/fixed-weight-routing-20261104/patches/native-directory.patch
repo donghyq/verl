@@ -1,0 +1,737 @@
+--- /dev/null
++++ b/source/tests/trainer/ppo/v1/test_native_cache_directory_on_cpu.py
+@@ -0,0 +1,241 @@
++# Copyright 2026 Project B contributors
++# Licensed under the Apache License, Version 2.0.
++"""CPU protocol/native-method checks; no GPU or active routing claim."""
++import ast
++from array import array
++from copy import deepcopy
++import importlib.util
++import json
++from pathlib import Path
++from types import MethodType, SimpleNamespace as NS
++import time
++
++import pytest
++from aiohttp import web
++
++from verl.trainer.ppo.v1.trajectory_state.native_cache_directory_client import (
++    NativeCacheDirectoryClient, native_query_digest, validate_native_prefix_response,
++)
++from verl.trainer.ppo.v1.trajectory_state.kv_route_advice import V1KVRouteAdvisor
++from test_kv_route_advice_on_cpu import CONTEXT, IDENTITY, Authority, prefix, view
++
++CANDIDATE = Path(__file__).resolve().parents[5]
++FROZEN = CANDIDATE/'frozen-engine/sglang/srt/mem_cache'
++PROBE = CANDIDATE/'engine-overlay/sglang/srt/mem_cache/native_cache_directory.py'
++spec = importlib.util.spec_from_file_location('native_cache_directory_under_test', PROBE)
++probe = importlib.util.module_from_spec(spec);spec.loader.exec_module(probe)
++
++
++def frozen_symbol(path, name):
++    tree=ast.parse(path.read_text())
++    node=next(n for n in ast.walk(tree) if isinstance(n,(ast.ClassDef,ast.FunctionDef)) and n.name==name)
++    future=ast.ImportFrom(module='__future__',names=[ast.alias(name='annotations')],level=0)
++    module=ast.fix_missing_locations(ast.Module(body=[future,node],type_ignores=[]))
++    namespace={'array':array}
++    exec(compile(module,str(path),'exec'),namespace)
++    return namespace[name]
++
++
++RadixKey=frozen_symbol(FROZEN/'radix_cache.py','RadixKey')
++FULL_VALIDATOR=frozen_symbol(FROZEN/'unified_cache/components/full_component.py','create_match_validator')
++MAMBA_VALIDATOR=frozen_symbol(FROZEN/'unified_cache/components/mamba_component.py','create_match_validator')
++
++
++def component(kind):
++    value=NS(component_type=kind)
++    value.create_match_validator=MethodType(FULL_VALIDATOR if kind==0 else MAMBA_VALIDATOR,value)
++    return value
++
++
++def node(tokens, *, mamba=True, full=True, salt='salt', identity=1):
++    return NS(id=identity,key=RadixKey(array('q',tokens),cache_salt=salt),children={},evicted=not full,
++              component_data={0:NS(value=object() if full else None,host_value=None),
++                              2:NS(value=object() if mamba else None,host_value=None)},last_access_time=10)
++
++
++def core_with_leaf(length=8195):
++    root=node([],identity=0);leaf=node(range(length));root.children[leaf.key.child_key(1)]=leaf
++    return NS(root_node=root,page_size=1,is_eagle=False,enable_hicache=False,
++              components=(component(0),component(2)),has_ongoing_insert=lambda:False),leaf
++
++
++def snapshot(core):
++    def walk(n):
++        return (n.id,tuple(n.key.token_ids),n.last_access_time,
++                tuple((k,id(v.value),id(v.host_value)) for k,v in n.component_data.items()),
++                tuple((repr(k),walk(v)) for k,v in n.children.items()))
++    return walk(core.root_node)
++
++
++def manager(core):
++    cache=type('UnifiedRadixCache',(),{})();cache.tree_core=core;cache.disable=False
++    return NS(engine_instance_id='native-a',scheduler=NS(tree_cache=cache,ps=NS(tp_rank=0,tp_size=2),
++              server_args=NS(enable_lora=False),running_batch=NS(reqs=[]),waiting_queue=[]))
++
++
++def query(tokens):
++    return NS(expected_weight_version='1',cache_query={'token_ids':tokens,'cache_salt':'salt',
++               'query_digest':native_query_digest(tokens,'salt')})
++
++
++@pytest.mark.parametrize('length,expected',[(8192,0),(8201,8195)])
++def test_exact_frozen_keys_and_component_validators_without_tree_or_lru_mutation(monkeypatch,length,expected):
++    monkeypatch.setenv('SGLANG_ENABLE_NATIVE_CACHE_DIRECTORY','1')
++    core,leaf=core_with_leaf();before=snapshot(core)
++    result=probe.inspect_cache_prefix(manager(core),query(list(range(length))),weight_version='1',key_factory=RadixKey)
++    assert result['native_complete_device_prefix']==expected
++    assert result['host_state_advertised'] is False and result['generation_admission_authorized'] is False
++    assert snapshot(core)==before
++    assert set(result)=={'query_digest','prompt_tokens','cache_salt','actual_weight_version','engine_instance_id',
++                         'cache_generation','observed_at_unix','native_full_kv_prefix','native_complete_device_prefix',
++                         'rank_match','running_requests','waiting_requests','coverage_source','host_state_advertised',
++                         'generation_admission_authorized'}
++
++
++@pytest.mark.parametrize('fault',['mamba_missing','mamba_host_only','full_evicted','wrong_salt'])
++def test_attention_or_host_state_alone_cannot_be_advertised_as_gpu_mixed_hit(fault):
++    core,leaf=core_with_leaf(length=9)
++    if fault in ('mamba_missing','mamba_host_only'):leaf.component_data[2].value=None
++    if fault=='mamba_host_only':leaf.component_data[2].host_value=object()
++    if fault=='full_evicted':leaf.evicted=True
++    salt='other' if fault=='wrong_salt' else 'salt'
++    matched,_=probe.peek_complete_device_prefix(core,RadixKey(array('q',range(12)),cache_salt=salt))
++    assert matched==0
++
++
++def test_existing_parent_boundary_survives_partial_child_without_split():
++    core,_=core_with_leaf(length=4);parent=next(iter(core.root_node.children.values()))
++    child=node(range(4,9),identity=2);parent.children[child.key.child_key(1)]=child
++    before=snapshot(core)
++    assert probe.peek_complete_device_prefix(core,RadixKey(array('q',range(7)),cache_salt='salt'))==(4,7)
++    assert snapshot(core)==before
++
++
++@pytest.mark.parametrize('fault',['hicache','speculative','insert_in_progress','wrong_components'])
++def test_unsupported_tree_modes_fail_closed(fault):
++    core,_=core_with_leaf()
++    if fault=='hicache':core.enable_hicache=True
++    if fault=='speculative':core.is_eagle=True
++    if fault=='insert_in_progress':core.has_ongoing_insert=lambda:True
++    if fault=='wrong_components':core.components=(component(0),)
++    with pytest.raises(ValueError):probe.peek_complete_device_prefix(core,RadixKey(array('q',[1]),cache_salt='salt'))
++
++
++@pytest.mark.parametrize('fault',['flag_off','weight','digest','salt','boolean_token','negative_token','oversize',
++                                  'old_instance','cache_reset','missing_rank','lora'])
++def test_identity_generation_and_input_constraints(monkeypatch,fault):
++    monkeypatch.setenv('SGLANG_ENABLE_NATIVE_CACHE_DIRECTORY','1')
++    core,_=core_with_leaf(length=9);m=manager(core);q=query(list(range(12)))
++    initial=probe.inspect_cache_prefix(m,q,weight_version='1',key_factory=RadixKey)
++    if fault=='flag_off':monkeypatch.delenv('SGLANG_ENABLE_NATIVE_CACHE_DIRECTORY')
++    if fault=='weight':q.expected_weight_version='0'
++    if fault=='digest':q.cache_query['query_digest']='f'*64
++    if fault=='salt':q.cache_query['cache_salt']=''
++    if fault=='boolean_token':q.cache_query['token_ids'][0]=True
++    if fault=='negative_token':q.cache_query['token_ids'][0]=-1
++    if fault=='oversize':q.cache_query['token_ids']=[1]*32769
++    if fault in ('old_instance','cache_reset','missing_rank'):
++        q.cache_query['expected_rank_generations']={str(r):{'engine_instance_id':initial['engine_instance_id'],
++            'cache_generation':initial['cache_generation']} for r in (0,1)}
++        if fault=='old_instance':m.engine_instance_id='new-native-a'
++        if fault=='cache_reset':core.root_node.id+=1
++        if fault=='missing_rank':q.cache_query['expected_rank_generations'].pop('1')
++    if fault=='lora':m.scheduler.server_args.enable_lora=True
++    with pytest.raises(ValueError):probe.inspect_cache_prefix(m,q,weight_version='1',key_factory=RadixKey)
++
++
++def native_response(payload,instance='a'):
++    q=payload['cache_query'];rows=[]
++    for rank in (0,1):
++        coverage=80 if rank==0 else 40
++        rows.append({'tp_rank':rank,'status':'PASS','query_digest':q['query_digest'],
++            'prompt_tokens':len(q['token_ids']),'cache_salt':q['cache_salt'],
++            'actual_weight_version':payload['expected_weight_version'],
++            'engine_instance_id':'native-'+instance+('-tp1' if rank else ''),
++            'cache_generation':('a' if instance=='a' else 'b')*64,'observed_at_unix':time.time(),
++            'native_complete_device_prefix':coverage,'rank_match':prefix(coverage),
++            'waiting_requests':0,'running_requests':0,'coverage_source':'native_read_only_full_mamba_tree',
++            'host_state_advertised':False,'generation_admission_authorized':False})
++    return {'status':'PASS','ranks':rows}
++
++
++@pytest.mark.parametrize('fault',['wrong_tokens','missing_rank','duplicate_rank','old_weight','rank_bool',
++                                  'missing_tier','host_claim','bad_generation','boolean_prefix'])
++def test_wire_proofs_cannot_be_replayed_or_incomplete(fault):
++    q={'token_ids':list(range(100)),'cache_salt':'salt','expected_weight_version':'1'}
++    payload={'expected_weight_version':'1','cache_query':{**q,'query_digest':native_query_digest(q['token_ids'],'salt')}}
++    response=native_response(payload)
++    if fault=='wrong_tokens':response['ranks'][1]['query_digest']='f'*64
++    if fault=='missing_rank':response['ranks'].pop()
++    if fault=='duplicate_rank':response['ranks'][1]['tp_rank']=0
++    if fault=='old_weight':response['ranks'][1]['actual_weight_version']='0'
++    if fault=='rank_bool':response['ranks'][1]['tp_rank']=True
++    if fault=='missing_tier':response['ranks'][1]['rank_match'].pop('disk')
++    if fault=='host_claim':response['ranks'][1]['host_state_advertised']=True
++    if fault=='bad_generation':response['ranks'][1]['cache_generation']='old'
++    if fault=='boolean_prefix':response['ranks'][1]['native_complete_device_prefix']=True
++    with pytest.raises(ValueError):validate_native_prefix_response(response,q,2)
++
++
++@pytest.mark.asyncio
++async def test_native_json_transport_full_rank_proof_shadow_call_and_publication_membership(tmp_path):
++    calls=[]
++    async def handler(request):
++        payload=await request.json();calls.append(payload)
++        instance=request.match_info['instance']
++        return web.json_response(native_response(payload,instance))
++    app=web.Application();app.router.add_post('/{instance}/token_kv_snapshot',handler)
++    runner=web.AppRunner(app);await runner.setup();site=web.TCPSite(runner,'127.0.0.1',0);await site.start()
++    port=site._server.sockets[0].getsockname()[1]
++    urls={key:f'http://127.0.0.1:{port}/{key}' for key in ('a','b')}
++    v=view()
++    for key in urls:
++        v['instances'][key]['engine_url']=urls[key]
++        # Global declarations intentionally disagree: native per-request data must win.
++        v['instances'][key]['hybrid_prefix_by_tp_rank']={'0':prefix(99),'1':prefix(99)}
++    path=tmp_path/'view.json';path.write_text(json.dumps(v))
++    class NativeAuthority(Authority):
++        async def get_active_published_policy(self):
++            record=await super().get_active_published_policy()
++            record['engine_observations']=[{'engine_url':url,'weight_version':'1','source':'model_info'} for url in urls.values()]
++            return record
++    advisor=V1KVRouteAdvisor({'mode':'shadow','view_path':str(path),'cache_context':CONTEXT,
++        'directory_source':'native_prefix_probe','native_instances':urls,'timeout_ms':100},publication_client=NativeAuthority())
++    try:
++        ticket=advisor.start({'input_ids':list(range(100))},policy_identity=IDENTITY,
++            cache_salt='observed-salt',allowed_urls=list(urls.values()))
++        result=await ticket
++        assert result['status']=='shadow_estimate'
++        assert {row['declared_device_prefix'] for row in result['candidates'].values()}=={40}
++        assert len(calls)==2 and all(c['operation']=='inspect_cache_prefix' for c in calls)
++        assert result['routing_changed'] is False
++        await advisor.observe(ticket,engine_url=urls['a'],worker_id='gateway-a',engine_instance_id='native-a')
++        assert advisor.records[-1]['actual_instance']=='a'
++        advisor.publication_client=Authority()  # Same policy, but observations cover another engine pool.
++        rejected=await advisor.start({'input_ids':list(range(100))},policy_identity=IDENTITY,
++            cache_salt='observed-salt',allowed_urls=list(urls.values()))
++        assert rejected['status']=='fallback' and len(calls)==2
++    finally:
++        advisor.close();await runner.cleanup()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('extra',[{'return_logprob':True,'logprob_start_len':0},
++                                  {'input_embeds':[]},{'session_params':{}},{'lora_path':'other'}])
++async def test_native_probe_rejects_request_shapes_that_change_cache_matching(tmp_path,extra):
++    value=view();path=tmp_path/'view.json';path.write_text(json.dumps(value))
++    class NoQuery:
++        calls=[]
++        def query(self,payload):
++            self.calls.append(payload)
++            raise AssertionError('unsupported request must not query')
++        def close(self):pass
++    client=NoQuery()
++    advisor=V1KVRouteAdvisor({'mode':'shadow','view_path':str(path),'cache_context':CONTEXT,
++        'directory_source':'native_prefix_probe'},client=client,publication_client=Authority())
++    try:
++        result=await advisor.start({'input_ids':list(range(100)),**extra},policy_identity=IDENTITY,
++            cache_salt='observed-salt',allowed_urls=['http://replica-a','http://replica-b'])
++        assert result['status']=='fallback' and result['reason']=='native_probe_unsupported_request_shape'
++        assert client.calls==[]
++    finally:advisor.close()
+--- a/source/verl/trainer/ppo/v1/trajectory_state/conductor_hint_client.py
++++ b/source/verl/trainer/ppo/v1/trajectory_state/conductor_hint_client.py
+@@ -6,7 +6,6 @@
+ import threading
+ from concurrent.futures import ThreadPoolExecutor
+ from urllib.parse import urlsplit
+-import msgpack
+ 
+ class ConductorHTTPClient:
+     """Bounded native HTTP/msgpack query; no cached view survives an error."""
+@@ -34,7 +33,7 @@
+             raise RuntimeError("Conductor client is closed")
+         if self._pending is not None and not self._pending.done():
+             raise TimeoutError("Previous Conductor query is still running")
+-        body = msgpack.packb(payload, use_bin_type=True)
++        body = self._encode_request(payload)
+         self._cancelled = threading.Event()
+         self._pending = self._executor.submit(self._post, body)
+         try:
+@@ -53,12 +52,8 @@
+                 if self._cancelled.is_set():
+                     raise TimeoutError("Conductor query expired before connection completed")
+                 active_socket = self._socket = connection.sock
+-            connection.request(
+-                "POST",
+-                self._url.path.rstrip("/") + "/query",
+-                body=body,
+-                headers={"Content-Type": "application/msgpack"},
+-            )
++            path, wire_body, headers = self._wire_request(body)
++            connection.request("POST", path, body=wire_body, headers=headers)
+             with connection.getresponse() as response:
+                 if response.status != 200:
+                     raise ValueError(f"Conductor returned HTTP {response.status}")
+@@ -70,6 +65,18 @@
+             connection.close()
+         if len(data) > 2 * 1024 * 1024:
+             raise ValueError("Conductor response exceeds 2 MiB")
++        return self._decode_response(data)
++
++    def _encode_request(self, payload: dict):
++        import msgpack
++        return msgpack.packb(payload, use_bin_type=True)
++
++    def _wire_request(self, body: bytes):
++        return (self._url.path.rstrip("/") + "/query", body,
++                {"Content-Type": "application/msgpack"})
++
++    def _decode_response(self, data: bytes):
++        import msgpack
+         result = msgpack.unpackb(data, raw=False, strict_map_key=False)
+         if not isinstance(result, dict) or not isinstance(result.get("instances"), dict):
+             raise ValueError("Conductor returned no instance map")
+--- a/source/verl/trainer/ppo/v1/trajectory_state/kv_route_advice.py
++++ b/source/verl/trainer/ppo/v1/trajectory_state/kv_route_advice.py
+@@ -17,6 +17,7 @@
+ from pathlib import Path
+ 
+ from .conductor_hint_client import ConductorHTTPClient
++from .native_cache_directory_client import NativeCacheDirectoryClient, native_query_digest
+ from .identity import _decode_policy_identity
+ from .policy_publication import PublishedPolicyRecord
+ 
+@@ -58,7 +59,16 @@
+                 or self.context["dp_size"] != 1 or type(self.context["dp_size"]) is not int
+                 or type(self.context["hybrid_model"]) is not bool):
+             raise ValueError("shadow cache context requires explicit model/layout and DP=1")
+-        self.client = client or ConductorHTTPClient(settings["endpoint"], self.timeout * 1000)
++        self.directory_source = settings.get("directory_source", "conductor_declared")
++        if self.directory_source not in {"conductor_declared", "native_prefix_probe"}:
++            raise ValueError("unknown directory source")
++        if self.directory_source == "native_prefix_probe":
++            if not self.context["hybrid_model"] or self.context["lora_name"]:
++                raise ValueError("native prefix directory v1 requires hybrid plain-text requests without LoRA")
++            self.client = client or NativeCacheDirectoryClient(
++                settings["native_instances"], tp_size=self.context["tp_size"], timeout_ms=self.timeout*1000)
++        else:
++            self.client = client or ConductorHTTPClient(settings["endpoint"], self.timeout * 1000)
+         self.clock = clock
+         self.publication_client = publication_client
+         self.run_id = run_id
+@@ -88,6 +98,12 @@
+         if vars(record.identity) != identity or (self.run_id is not None and record.run_id != self.run_id):
+             raise AdvicePublicationInvalid("request identity/run differs from the current publication")
+         return record
++
++    def _assert_native_publication_membership(self, record, urls):
++        if self.directory_source == "native_prefix_probe":
++            observed = {row.engine_url.rstrip("/") for row in record.engine_observations}
++            if not {url.rstrip("/") for url in urls} <= observed:
++                raise AdvicePublicationInvalid("native candidate is absent from the current engine publication")
+ 
+     def _view(self, identity, cache_salt, allowed_urls):
+         with self.path.open("rb") as stream:
+@@ -125,39 +141,55 @@
+         # query to different tokens or weights while it is in flight.
+         identity, tokens = deepcopy(policy_identity), deepcopy(payload.get("input_ids"))
+         task = asyncio.create_task(self._advise(identity, tokens, cache_salt, tuple(allowed_urls),
+-                                               payload.get("rid"), deepcopy(request_context)))
++                                               payload.get("rid"), deepcopy(request_context), native_eligible=(
++                                                   not any(payload.get(key) is not None for key in (
++                                                       "input_embeds", "positional_embed_overrides", "image_data",
++                                                       "lora_path", "extra_key", "session_params"))
++                                                   and (not payload.get("return_logprob")
++                                                        or payload.get("logprob_start_len", -1)==-1))))
+         self.tickets.add(task)
+         task.add_done_callback(self.tickets.discard)
+         task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+         return task
+ 
+-    async def _advise(self, identity, tokens, salt, allowed_urls, request_id, request_context):
++    async def _advise(self, identity, tokens, salt, allowed_urls, request_id, request_context, *, native_eligible=True):
+         started = time.perf_counter()
+         deadline = started + self.timeout
+         result = {"status": "fallback", "routing_changed": False, "reason": "unavailable", "candidates": {}}
+         result.update(request_id=request_id, request_context=request_context)
+         try:
+             _decode_policy_identity(identity)
++            if self.directory_source == "native_prefix_probe" and not native_eligible:
++                result["reason"] = "native_probe_unsupported_request_shape"
++                return result
+             if (not isinstance(tokens, list) or not tokens or len(tokens) > 32768
+                     or any(type(token) is not int or token < 0 for token in tokens)):
+                 raise ValueError("plain-text token history required")
+             result.update(policy_identity=identity, cache_salt=salt, prompt_tokens=len(tokens),
+                           token_ids_sha256=hashlib.sha256(json.dumps(tokens, separators=(",", ":")).encode()).hexdigest())
+-            await self._assert_current_publication(identity, deadline)
++            publication = await self._assert_current_publication(identity, deadline)
+             view, digest = self._view(identity, salt, allowed_urls)
++            self._assert_native_publication_membership(publication,
++                [row["engine_url"] for row in view["instances"].values()])
+             result.update(view_generation=view["generation"], view_sha256=digest)
+             if self.pending is not None and not self.pending.done():
+                 result["reason"] = "query_busy"
+                 return result
+             context = {key: self.context[key] for key in ("model", "tenant_id", "lora_name", "block_size")}
+-            self.pending = asyncio.create_task(asyncio.to_thread(
+-                self.client.query, {**context, "cache_salt": salt, "token_ids": tokens}))
++            query = {**context, "cache_salt": salt, "token_ids": tokens}
++            if self.directory_source == "native_prefix_probe":
++                query.update(expected_weight_version=str(identity["policy_version"]),
++                             native_allowed_instances={key:row["engine_url"] for key,row in view["instances"].items()},
++                             native_expected_rank_generations={key:row["native_rank_generations"]
++                                for key,row in view["instances"].items() if "native_rank_generations" in row})
++            self.pending = asyncio.create_task(asyncio.to_thread(self.client.query, query))
+             self.pending.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+             remaining = deadline - time.perf_counter()
+             if remaining <= 0:
+                 raise asyncio.TimeoutError
+             hits = await asyncio.wait_for(asyncio.shield(self.pending), remaining)
+             result["query_seconds"] = time.perf_counter() - started
++            result["directory_source"] = self.directory_source
+             length, calibration = len(tokens), view["calibration"]
+             if not calibration["prompt_tokens_min"] <= length <= calibration["prompt_tokens_max"]:
+                 raise ValueError("prompt outside calibrated range")
+@@ -166,8 +198,35 @@
+                     if (not isinstance(instance_id, str) or not instance_id
+                             or not isinstance(row.get("engine_instance_id"), str) or not row["engine_instance_id"]):
+                         raise ValueError("missing native instance identity")
+-                    device, host = _prefix(hits.get(instance_id, {}).get("rank_matches", {}).get("0", {}), length)
+-                    if self.context["hybrid_model"]:
++                    hit = hits.get(instance_id, {})
++                    device, host = _prefix(hit.get("rank_matches", {}).get("0", {}), length)
++                    if self.directory_source == "native_prefix_probe":
++                        proof = hit["native_query"]
++                        ranks = {str(rank) for rank in range(self.context["tp_size"])}
++                        age = self.clock() - _number(proof["observed_at_unix"])
++                        if (proof["query_digest"] != native_query_digest(tokens, salt)
++                                or proof["engine_instance_id"] != row["engine_instance_id"]
++                                or proof["actual_weight_version"] != str(identity["policy_version"])
++                                or set(hit["rank_matches"]) != ranks or set(proof["rank_generations"]) != ranks
++                                or not -1 <= age <= self.ttl):
++                            raise ValueError("native mixed-state proof is stale or belongs to another request/instance")
++                        expected = row.get("native_rank_generations")
++                        if expected is not None and expected != proof["rank_generations"]:
++                            raise ValueError("stable native target/cache generation changed")
++                        if any(set(value) != {"device", "cpu_local", "cpu_share", "disk"}
++                               for value in hit["rank_matches"].values()):
++                            raise ValueError("native rank coverage lacks explicit tier fields")
++                        for value in proof["rank_generations"].values():
++                            if (set(value) != {"engine_instance_id", "cache_generation"}
++                                    or not isinstance(value["engine_instance_id"], str) or not value["engine_instance_id"]
++                                    or not isinstance(value["cache_generation"], str) or len(value["cache_generation"])!=64
++                                    or any(c not in "0123456789abcdef" for c in value["cache_generation"])):
++                                raise ValueError("native rank generation is malformed")
++                        native_prefixes = [_prefix(value, length) for value in hit["rank_matches"].values()]
++                        if any(a != b or not 0 <= a < length for a,b in native_prefixes):
++                            raise ValueError("native GPU-only coverage is inconsistent")
++                        device = host = min(value[0] for value in native_prefixes)
++                    elif self.context["hybrid_model"]:
+                         coverage = row["hybrid_prefix_by_tp_rank"]
+                         if set(coverage) != {str(rank) for rank in range(self.context["tp_size"])}:
+                             raise ValueError("missing mixed-state rank coverage")
+@@ -200,7 +259,9 @@
+             _, current = self._view(identity, salt, allowed_urls)
+             if current != digest:
+                 result.update(status="fallback", reason="view_changed_during_query", candidates={})
+-            await self._assert_current_publication(identity, deadline)
++            publication = await self._assert_current_publication(identity, deadline)
++            self._assert_native_publication_membership(publication,
++                [row["engine_url"] for row in view["instances"].values()])
+         except AdvicePublicationInvalid:
+             result.update(status="fallback", reason="publication_unavailable_or_mismatched", candidates={})
+         except asyncio.TimeoutError:
+@@ -224,8 +285,10 @@
+             result.update(actual_engine_url=engine_url, actual_worker_id=worker_id,
+                           actual_engine_instance_id=engine_instance_id)
+             if result["status"] == "shadow_estimate":
+-                await self._assert_current_publication(
++                publication = await self._assert_current_publication(
+                     result["policy_identity"], started + self.timeout)
++                self._assert_native_publication_membership(publication,
++                    [row["engine_url"] for row in result["candidates"].values()])
+                 # Recheck at observation too: weights/retirement may change
+                 # after the query completed but before the actual SSE returned.
+                 _, current = self._view(result["policy_identity"], result["cache_salt"],
+--- /dev/null
++++ b/source/verl/trainer/ppo/v1/trajectory_state/native_cache_directory_client.py
+@@ -0,0 +1,139 @@
++# Copyright 2026 Project B contributors
++# Licensed under the Apache License, Version 2.0.
++"""Bounded native per-request prefix observations; shadow only, no dispatch."""
++from concurrent.futures import ThreadPoolExecutor, wait
++import hashlib
++import json
++import math
++import threading
++import time
++
++from .conductor_hint_client import ConductorHTTPClient
++
++
++def native_query_digest(tokens, salt):
++    return hashlib.sha256(json.dumps({'token_ids': tokens, 'cache_salt': salt},
++                                    sort_keys=True, separators=(',', ':')).encode()).hexdigest()
++
++
++class NativeEnginePrefixClient(ConductorHTTPClient):
++    """Reuse the existing bounded/cancellable HTTP transport, with JSON wire format."""
++    def _encode_request(self, payload):
++        return json.dumps(payload).encode()
++
++    def _wire_request(self, body):
++        query = json.loads(body)
++        return (self._url.path.rstrip('/') + '/token_kv_snapshot', json.dumps({
++            'operation': 'inspect_cache_prefix',
++            'expected_weight_version': query['expected_weight_version'],
++            'cache_query': {key: query[key] for key in (
++                'token_ids', 'cache_salt', 'query_digest', 'expected_rank_generations') if key in query},
++        }).encode(), {'Content-Type': 'application/json'})
++
++    def _decode_response(self, data):
++        result = json.loads(data)
++        if not isinstance(result, dict) or result.get('status') != 'PASS':
++            raise ValueError('native cache query failed')
++        return result
++
++
++def validate_native_prefix_response(result, query, tp_size):
++    tokens = query['token_ids'];digest = native_query_digest(tokens, query['cache_salt'])
++    ranks = result.get('ranks')
++    if (result.get('status') != 'PASS' or not isinstance(ranks, list) or len(ranks) != tp_size
++            or any(type(row.get('tp_rank')) is not int for row in ranks)
++            or {row['tp_rank'] for row in ranks} != set(range(tp_size))):
++        raise ValueError('native prefix response lacks every unique TP rank')
++    ordered = sorted(ranks, key=lambda row: row['tp_rank'])
++    matches, generations = {}, {}
++    for row in ordered:
++        if (row.get('status') != 'PASS' or row.get('query_digest') != digest
++                or type(row.get('prompt_tokens')) is not int or row.get('prompt_tokens') != len(tokens) or row.get('cache_salt') != query['cache_salt']
++                or row.get('actual_weight_version') != query['expected_weight_version']
++                or row.get('coverage_source') != 'native_read_only_full_mamba_tree'
++                or row.get('host_state_advertised') is not False
++                or row.get('generation_admission_authorized') is not False):
++            raise ValueError('native prefix proof is not bound to this request and weight version')
++        instance, generation = row.get('engine_instance_id'), row.get('cache_generation')
++        if (not isinstance(instance, str) or not instance or not isinstance(generation, str)
++                or len(generation) != 64 or any(c not in '0123456789abcdef' for c in generation)):
++            raise ValueError('native target generation is unavailable')
++        match = row.get('rank_match')
++        if (not isinstance(match, dict) or set(match) != {'device', 'cpu_local', 'cpu_share', 'disk'}
++                or any(type(v) is not int or not 0 <= v < len(tokens) for v in match.values())
++                or len(set(match.values())) != 1
++                or type(row.get('native_complete_device_prefix')) is not int
++                or row.get('native_complete_device_prefix') != match['device']):
++            raise ValueError('invalid device-only native coverage')
++        for key in ('waiting_requests', 'running_requests'):
++            if type(row.get(key)) is not int or row[key] < 0:
++                raise ValueError('invalid native queue counter')
++        observed = row.get('observed_at_unix')
++        if isinstance(observed, bool) or not isinstance(observed, (int,float)) or not math.isfinite(observed):
++            raise ValueError('invalid native observation time')
++        key = str(row['tp_rank']);matches[key] = match
++        generations[key] = {'engine_instance_id': instance, 'cache_generation': generation}
++    expected = query.get('expected_rank_generations')
++    if expected is not None and expected != generations:
++        raise ValueError('native stable target or cache generation changed')
++    return {'rank_matches': matches, 'native_query': {
++        'query_digest': digest, 'actual_weight_version': query['expected_weight_version'],
++        'engine_instance_id': ordered[0]['engine_instance_id'], 'rank_generations': generations,
++        'observed_at_unix': min(row['observed_at_unix'] for row in ordered),
++        'queue_counters_by_rank': {str(row['tp_rank']): {k:row[k] for k in ('waiting_requests','running_requests')}
++                                   for row in ordered},
++    }}
++
++
++class NativeCacheDirectoryClient:
++    """Observe configured native engines concurrently, with one bounded query in flight."""
++    def __init__(self, instances, *, tp_size, timeout_ms=50):
++        if (not isinstance(instances, dict) or not 1 <= len(instances) <= 8
++                or type(tp_size) is not int or not 1 <= tp_size <= 8
++                or isinstance(timeout_ms,bool) or not 0 < timeout_ms <= 100):
++            raise ValueError('bounded native instance map, TP size and timeout required')
++        if any(not isinstance(k,str) or not k or not isinstance(v,str) for k,v in instances.items()):
++            raise ValueError('native instance keys/URLs must be explicit')
++        if len(set(instances.values())) != len(instances):
++            raise ValueError('native instance URLs must be unique')
++        self.instances = dict(instances);self.tp_size = tp_size;self.timeout = timeout_ms/1000
++        self.clients = {k:NativeEnginePrefixClient(v,timeout_ms) for k,v in instances.items()}
++        self.pool = ThreadPoolExecutor(max_workers=len(instances),thread_name_prefix='native-prefix')
++        self.lock = threading.Lock();self.closed = False;self.last_errors = {}
++
++    def query(self, payload):
++        if self.closed or not self.lock.acquire(blocking=False):
++            raise TimeoutError('native prefix directory is closed or busy')
++        try:
++            if payload.get('lora_name') != '':
++                raise ValueError('native directory v1 does not support LoRA')
++            allowed = payload['native_allowed_instances']
++            if (not isinstance(allowed,dict) or not allowed or len(allowed)>8
++                    or any(self.instances.get(k)!=v for k,v in allowed.items())):
++                raise ValueError('native query membership differs from original pool')
++            query = {key:payload[key] for key in ('token_ids','cache_salt','expected_weight_version')}
++            query['query_digest'] = native_query_digest(query['token_ids'],query['cache_salt'])
++            expected = payload.get('native_expected_rank_generations',{})
++            futures={}
++            for key in allowed:
++                per_instance = dict(query)
++                if key in expected:per_instance['expected_rank_generations'] = expected[key]
++                futures[self.pool.submit(self.clients[key].query,per_instance)] = (key,per_instance)
++            done,pending = wait(futures,timeout=self.timeout)
++            self.last_errors = {futures[future][0]: "query_timeout" for future in pending}
++            for future in pending:future.cancel()
++            output = {}
++            for future in done:
++                key,per_instance=futures[future]
++                try:output[key] = validate_native_prefix_response(future.result(),per_instance,self.tp_size)
++                except Exception as error:
++                    self.last_errors[key] = type(error).__name__ + ": " + str(error)[:256]
++                    continue  # Failed peers never inherit prior coverage.
++            return output
++        finally:
++            self.lock.release()
++
++    def close(self):
++        self.closed = True
++        for client in self.clients.values():client.close()
++        self.pool.shutdown(wait=False,cancel_futures=True)
+--- a/engine-overlay/sglang/srt/managers/io_struct.py
++++ b/engine-overlay/sglang/srt/managers/io_struct.py
+@@ -2212,6 +2212,7 @@
+     identity: Optional[Dict[str, Any]] = None
+     release_full_gpu_pool: bool = False
+     source_binding: Optional[Dict[str, Any]] = None
++    cache_query: Optional[Dict[str, Any]] = None
+ 
+ 
+ class TokenKVSnapshotReqOutput(BaseReq, kw_only=True):
+--- a/engine-overlay/sglang/srt/managers/token_kv_snapshot.py
++++ b/engine-overlay/sglang/srt/managers/token_kv_snapshot.py
+@@ -1290,7 +1290,13 @@
+         local = {"tp_rank": self.scheduler.ps.tp_rank}
+         try:
+             failures = self._check_runtime()
+-            if request.operation == "inspect":
++            if request.operation == "inspect_cache_prefix":
++                if failures:
++                    raise ValueError("; ".join(failures))
++                from sglang.srt.mem_cache.native_cache_directory import inspect_cache_prefix
++                local.update(inspect_cache_prefix(self, request,
++                             weight_version=get_serving().weight_version), status="PASS")
++            elif request.operation == "inspect":
+                 local.update(
+                     status="PASS" if not failures else "UNSUPPORTED",
+                     identity=self._identity() if not failures else None,
+--- /dev/null
++++ b/engine-overlay/sglang/srt/mem_cache/native_cache_directory.py
+@@ -0,0 +1,105 @@
++# Copyright 2026 Project B contributors
++# Licensed under the Apache License, Version 2.0.
++"""Request-bound GPU prefix metadata; no cache handles or state installation.
++
++The scheduler invokes this synchronously on its own control-message path.
++This first version supports FULL+MAMBA UnifiedTreeCore, device state only.
++"""
++from __future__ import annotations
++
++from array import array
++import hashlib
++import json
++import os
++import time
++
++
++def request_digest(tokens, cache_salt):
++    return hashlib.sha256(json.dumps({'token_ids': tokens, 'cache_salt': cache_salt},
++                                    sort_keys=True, separators=(',', ':')).encode()).hexdigest()
++
++
++def peek_complete_device_prefix(core, key):
++    """Observe existing full-node boundaries without native match's split/LRU/COW."""
++    if core.is_eagle or core.enable_hicache:
++        raise ValueError('directory v1 requires non-speculative device-only unified tree')
++    if core.has_ongoing_insert():
++        raise ValueError('cache insert is in progress')
++    if {int(component.component_type) for component in core.components} != {0, 2}:
++        raise ValueError('directory v1 requires exactly FULL and MAMBA components')
++    validators = tuple(c.create_match_validator(match_device_only=True) for c in core.components)
++    key = key.page_aligned(core.page_size)
++    node, consumed, complete, full_hit = core.root_node, 0, 0, 0
++    while len(key):
++        child = node.children.get(key.child_key(core.page_size))
++        if child is None or child.evicted:
++            break
++        matched = child.key.match(key, page_size=core.page_size)
++        if matched <= 0:
++            break
++        full_hit += matched
++        if matched < len(child.key):
++            # A hypothetical split has no Mamba state at this new boundary.
++            # Return the last existing boundary, without making the split.
++            break
++        consumed += matched
++        if all(validator(child) for validator in validators):
++            complete = consumed
++        key, node = key[matched:], child
++    return complete, full_hit
++
++
++def inspect_cache_prefix(manager, request, *, weight_version, key_factory=None):
++    if os.environ.get('SGLANG_ENABLE_NATIVE_CACHE_DIRECTORY') != '1':
++        raise ValueError('SGLANG_ENABLE_NATIVE_CACHE_DIRECTORY=1 is required')
++    query = request.cache_query
++    if not isinstance(query, dict) or set(query) - {
++            'token_ids', 'cache_salt', 'query_digest', 'expected_rank_generations'}:
++        raise ValueError('invalid request-bound cache query')
++    tokens, salt = query.get('token_ids'), query.get('cache_salt')
++    if (not isinstance(tokens, list) or not 1 <= len(tokens) <= 32768
++            or any(type(token) is not int or not 0 <= token < 2**31 for token in tokens)
++            or not isinstance(salt, str) or not 0 < len(salt) <= 256):
++        raise ValueError('bounded exact token IDs and explicit cache salt are required')
++    digest = request_digest(tokens, salt)
++    if query.get('query_digest') != digest:
++        raise ValueError('cache query does not match its token/salt identity')
++    if (not isinstance(weight_version, str) or not weight_version
++            or request.expected_weight_version != weight_version):
++        raise ValueError('actual engine weight version differs from requested version')
++    scheduler = manager.scheduler
++    cache = scheduler.tree_cache
++    if cache.__class__.__name__ != 'UnifiedRadixCache' or cache.disable:
++        raise ValueError('enabled native UnifiedRadixCache is required')
++    if getattr(scheduler.server_args, 'enable_lora', False):
++        raise ValueError('directory v1 does not support LoRA cache keys')
++    core = cache.tree_core
++    if key_factory is None:
++        from sglang.srt.mem_cache.radix_cache import RadixKey
++        key_factory = RadixKey
++    # Native scheduling retains the final input token for the next forward.
++    key = key_factory(array('q', tokens[:-1]), cache_salt=salt)
++    complete, full_hit = peek_complete_device_prefix(core, key)
++    generation = hashlib.sha256(json.dumps({
++        'engine_instance_id': manager.engine_instance_id,
++        'root_node_id': core.root_node.id,
++        'weight_version': weight_version,
++    }, sort_keys=True).encode()).hexdigest()
++    expected = query.get('expected_rank_generations')
++    rank = str(scheduler.ps.tp_rank)
++    if expected is not None and (not isinstance(expected, dict)
++            or set(expected) != {str(r) for r in range(scheduler.ps.tp_size)} or expected.get(rank) != {
++            'engine_instance_id': manager.engine_instance_id, 'cache_generation': generation}):
++        raise ValueError('stable target identity or cache generation changed')
++    # Only lengths and native identities leave the scheduler; no node/slot handles.
++    return {
++        'query_digest': digest, 'prompt_tokens': len(tokens), 'cache_salt': salt,
++        'actual_weight_version': weight_version, 'engine_instance_id': manager.engine_instance_id,
++        'cache_generation': generation, 'observed_at_unix': time.time(),
++        'native_full_kv_prefix': full_hit, 'native_complete_device_prefix': complete,
++        'rank_match': dict.fromkeys(('device', 'cpu_local', 'cpu_share', 'disk'), complete),
++        'running_requests': len(scheduler.running_batch.reqs),
++        'waiting_requests': len(scheduler.waiting_queue),
++        'coverage_source': 'native_read_only_full_mamba_tree',
++        'host_state_advertised': False, 'generation_admission_authorized': False,
++    }

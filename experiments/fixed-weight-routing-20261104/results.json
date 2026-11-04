@@ -1,0 +1,88 @@
+{
+  "scope": "fixed-weight component screen, not RL optimizer result",
+  "model": "Qwen3.5-35B-A3B BF16",
+  "hardware": "2x NVIDIA A800 80GB, TP1 per replica",
+  "quality": "192 member-turns, matching input, token IDs and reported output probabilities",
+  "groups_per_arm": 6,
+  "optimizer_updates": 0,
+  "native_calibration_seconds": {
+    "default": 19.57,
+    "tuned": 14.85,
+    "session": 14.97
+  },
+  "native_selected": "cache-aware tuned",
+  "pairs": [
+    {
+      "pair": 0,
+      "order": [
+        "native",
+        "joint"
+      ],
+      "native_seconds": 21.958490133285522,
+      "joint_seconds": 19.374204874038696,
+      "relative_component_throughput_gain": 0.13338793906890856,
+      "quality": {
+        "equivalent": true,
+        "token_mismatch_members": [],
+        "max_reported_logprob_abs_delta": 0.0,
+        "logprob_tolerance": 0.0
+      }
+    },
+    {
+      "pair": 1,
+      "order": [
+        "joint",
+        "native"
+      ],
+      "native_seconds": 21.799826860427856,
+      "joint_seconds": 19.355822801589966,
+      "relative_component_throughput_gain": 0.12626712301980425,
+      "quality": {
+        "equivalent": true,
+        "token_mismatch_members": [],
+        "max_reported_logprob_abs_delta": 0.0,
+        "logprob_tolerance": 0.0
+      }
+    },
+    {
+      "pair": 2,
+      "order": [
+        "native",
+        "joint"
+      ],
+      "native_seconds": 19.489014148712158,
+      "joint_seconds": 21.895726919174194,
+      "relative_component_throughput_gain": -0.10991700706471941,
+      "quality": {
+        "equivalent": true,
+        "token_mismatch_members": [],
+        "max_reported_logprob_abs_delta": 0.0,
+        "logprob_tolerance": 0.0
+      }
+    }
+  ],
+  "pooled_component_gain": 0.043241961525166905,
+  "window_cost_adjusted_component_gain": 0.00618943573873576,
+  "window_gpu_hours": 0.47207,
+  "cached_token_sum_per_trial": 131072,
+  "applied_target_decisions": 11,
+  "fallback_decisions": 85,
+  "total_decisions": 96,
+  "long_sample_first_turn_fallbacks": 6,
+  "scheduler_wait_measured": false,
+  "formal_rl_gain_confirmed": false,
+  "eight_k_checkpoint_quality": {
+    "warm_cold_exact": true,
+    "baseline_logprob_max_delta": 0.0013448076788336039,
+    "cached_prefix_tokens": 8192,
+    "limits": "single fixed-weight 8K condition"
+  },
+  "previous_training_pair": {
+    "updates_per_arm": 12,
+    "groups_per_arm": 96,
+    "relative_efficiency_lower": -0.025269588559263423,
+    "relative_efficiency_upper": -0.01841051255915871,
+    "scope": "descriptive single pair; allocation interval uncertainty, not confidence interval or causal effect"
+  },
+  "raw_receipts_published": false
+}

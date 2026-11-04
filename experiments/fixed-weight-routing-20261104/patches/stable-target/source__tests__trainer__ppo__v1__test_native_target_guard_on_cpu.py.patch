@@ -1,0 +1,160 @@
+--- a/source/tests/trainer/ppo/v1/test_native_target_guard_on_cpu.py
++++ b/source/tests/trainer/ppo/v1/test_native_target_guard_on_cpu.py
+@@ -0,0 +1,157 @@
++# Copyright 2026 Project B contributors
++# Licensed under the Apache License, Version 2.0.
++"""Actual frozen scheduler rejection branch; CPU pools and TP collectives are substitutes."""
++import ast
++from array import array
++from copy import deepcopy
++from http import HTTPStatus
++import importlib.util
++from pathlib import Path
++import sys
++from types import ModuleType, SimpleNamespace as NS
++
++import pytest
++import torch
++from test_native_cache_directory_on_cpu import RadixKey, core_with_leaf, manager, probe, query
++
++ROOT=Path(__file__).resolve().parents[5]
++path=ROOT/'engine-overlay/sglang/srt/managers/native_target_guard.py'
++spec=importlib.util.spec_from_file_location('native_target_guard_under_test',path)
++guard=importlib.util.module_from_spec(spec);spec.loader.exec_module(guard)
++
++
++def fixture(monkeypatch, *, tp_size=1):
++    monkeypatch.setenv('SGLANG_ENABLE_STABLE_NATIVE_TARGET','1')
++    monkeypatch.setenv('SGLANG_ENABLE_NATIVE_CACHE_DIRECTORY','1')
++    core,leaf=core_with_leaf(length=9);m=manager(core);s=m.scheduler
++    s.ps.tp_size=tp_size;s.tp_cpu_group='cpu-fixture-group';s.token_kv_snapshot_manager=m
++    m._check_runtime=lambda:[]
++    ids=list(range(12));q=query(ids)
++    proof=probe.inspect_cache_prefix(m,q,weight_version='1',key_factory=RadixKey)
++    ranks={'0':{'engine_instance_id':proof['engine_instance_id'],'cache_generation':proof['cache_generation']}}
++    if tp_size==2:ranks['1']={'engine_instance_id':'native-rank1','cache_generation':'b'*64}
++    tag={'schema_version':1,'policy_version':'1','query_digest':proof['query_digest'],
++         'rank_generations':ranks,'minimum_device_prefix':9}
++    req=NS(native_target=deepcopy(tag),input_ids=array('q',ids),cache_salt='salt')
++    monkeypatch.setattr(guard,'_actual_weight_version',lambda:'1')
++    monkeypatch.setattr(guard,'_inspect_prefix',lambda manager,request,version:
++                        probe.inspect_cache_prefix(manager,request,weight_version=version,key_factory=RadixKey))
++    return s,m,core,leaf,req,tag
++
++
++def test_valid_local_target_and_absent_tag_do_not_change_cache_or_call_collectives(monkeypatch):
++    s,m,core,leaf,req,tag=fixture(monkeypatch)
++    assert guard.check_native_target_before_admission(s,req) is None
++    monkeypatch.setattr(guard,'_actual_weight_version',lambda:(_ for _ in ()).throw(AssertionError('ordinary request must not probe')))
++    assert guard.check_native_target_before_admission(s,NS(native_target=None)) is None
++
++
++@pytest.mark.parametrize('fault',['old_weight','old_engine','cache_reset','evicted_prefix','wrong_tokens',
++                                 'wrong_salt','missing_manager','wrong_tp','flag_off','unsupported_runtime'])
++def test_state_changes_reject_before_admission(monkeypatch,fault):
++    s,m,core,leaf,req,tag=fixture(monkeypatch)
++    if fault=='old_weight':monkeypatch.setattr(guard,'_actual_weight_version',lambda:'2')
++    if fault=='old_engine':m.engine_instance_id='restarted'
++    if fault=='cache_reset':core.root_node.id+=1
++    if fault=='evicted_prefix':leaf.component_data[2].value=None
++    if fault=='wrong_tokens':req.input_ids[0]=999
++    if fault=='wrong_salt':req.cache_salt='different'
++    if fault=='missing_manager':s.token_kv_snapshot_manager=None
++    if fault=='wrong_tp':s.ps.tp_size=2
++    if fault=='flag_off':monkeypatch.delenv('SGLANG_ENABLE_STABLE_NATIVE_TARGET')
++    if fault=='unsupported_runtime':m._check_runtime=lambda:['ReplaySSM is unsupported']
++    if fault=='wrong_tp':monkeypatch.setattr(guard,'_gather_checks',lambda _,row:[row,{'tp_rank':1,'status':'FAILED'}])
++    assert guard.check_native_target_before_admission(s,req).startswith('native_target_rejected_before_admission:')
++
++
++@pytest.mark.parametrize('fault',['peer_rejected','missing_rank','duplicate_rank'])
++def test_real_collective_call_requires_all_rank_agreement(monkeypatch,fault):
++    s,m,core,leaf,req,tag=fixture(monkeypatch,tp_size=2);calls=[]
++    def gather(rows,local,group):
++        calls.append((deepcopy(local),group))
++        peer={'tp_rank':1,'status':'PASS'}
++        if fault=='peer_rejected':peer.update(status='FAILED',reason='old engine instance')
++        if fault=='missing_rank':peer=None
++        if fault=='duplicate_rank':peer['tp_rank']=0
++        rows[:]=[local,peer]
++    monkeypatch.setattr(torch.distributed,'all_gather_object',gather)
++    error=guard.check_native_target_before_admission(s,req)
++    assert error.startswith('native_target_rejected_before_admission:')
++    assert len(calls)==1 and calls[0][0]['status']=='PASS' and calls[0][1]=='cpu-fixture-group'
++
++
++def test_collective_failure_never_reports_success(monkeypatch):
++    s,m,core,leaf,req,tag=fixture(monkeypatch,tp_size=2)
++    monkeypatch.setattr(torch.distributed,'all_gather_object',lambda *args,**kwargs:
++                        (_ for _ in ()).throw(RuntimeError('CPU collective failed')))
++    with pytest.raises(RuntimeError,match='collective failed'):guard.check_native_target_before_admission(s,req)
++
++
++def front_input(tag):
++    return NS(native_target=tag,is_single=True,text=None,input_ids=list(range(12)),return_logprob=True,logprob_start_len=-1)
++
++
++def test_frontend_copies_the_target_before_asynchronous_tokenization(monkeypatch):
++    _,_,_,_,_,tag=fixture(monkeypatch);obj=front_input(tag)
++    guard.prepare_targeted_generate_input(obj)
++    tag['rank_generations']['0']['engine_instance_id']='caller-mutated'
++    assert obj.native_target['rank_generations']['0']['engine_instance_id']=='native-a'
++
++
++@pytest.mark.parametrize('fault',['disabled','batch','text','embeds','lora','session','restore','input_logprobs',
++                                 'bad_schema','boolean_minimum','wrong_rank_names'])
++def test_frontend_rejects_unsupported_requests_without_admission(monkeypatch,fault):
++    _,_,_,_,_,tag=fixture(monkeypatch);obj=front_input(tag)
++    if fault=='disabled':monkeypatch.delenv('SGLANG_ENABLE_STABLE_NATIVE_TARGET')
++    if fault=='batch':obj.is_single=False
++    if fault=='text':obj.text='text with no bound exact IDs'
++    if fault=='embeds':obj.input_embeds=[]
++    if fault=='lora':obj.lora_path='adapter'
++    if fault=='session':obj.session_id='session'
++    if fault=='restore':obj.token_kv_restore={}
++    if fault=='input_logprobs':obj.logprob_start_len=0
++    if fault=='bad_schema':obj.native_target['schema_version']=True
++    if fault=='boolean_minimum':obj.native_target['minimum_device_prefix']=True
++    if fault=='wrong_rank_names':obj.native_target['rank_generations']={'00':tag['rank_generations']['0']}
++    with pytest.raises(ValueError):guard.prepare_targeted_generate_input(obj)
++
++
++def test_actual_scheduler_rejection_branch_never_enqueues_or_allocates_gpu_slots(monkeypatch):
++    s,m,core,leaf,recv,tag=fixture(monkeypatch,tp_size=2)
++    def gather(rows,local,group):rows[:]=[local,{'tp_rank':1,'status':'FAILED','reason':'retired target'}]
++    monkeypatch.setattr(torch.distributed,'all_gather_object',gather)
++    for name in ('sglang','sglang.srt','sglang.srt.managers'):
++        module=ModuleType(name);module.__path__=[];monkeypatch.setitem(sys.modules,name,module)
++    monkeypatch.setitem(sys.modules,'sglang.srt.managers.native_target_guard',guard)
++    source=(ROOT/'engine-overlay/sglang/srt/managers/scheduler.py').read_text()
++    method=next(n for n in ast.walk(ast.parse(source)) if isinstance(n,ast.FunctionDef) and n.name=='handle_generate_request')
++    future=ast.ImportFrom(module='__future__',names=[ast.alias(name='annotations')],level=0)
++    created,outputs,queued=[],[],[]
++    def create(*args,**kwargs):
++        req=NS(return_logprob=kwargs['return_logprob']);created.append(req);return req
++    def abort(req,message,status_code):req.abort_message=message;req.status=status_code
++    namespace={'Req':create,'prepare_abort':abort,'HTTPStatus':HTTPStatus}
++    exec(compile(ast.fix_missing_locations(ast.Module(body=[future,method],type_ignores=[])),
++                 'frozen-scheduler-target-rejection','exec'),namespace)
++    s.model_config=NS(vocab_size=200000);s.tokenizer=None
++    s.output_streamer=NS(stream_output=lambda reqs,logprob:outputs.extend(reqs))
++    s._add_request_to_queue=lambda req:queued.append(req)
++    recv.rid='bound-request';recv.input_text=None;recv.sampling_params=NS();recv.return_logprob=True
++    recv.stream=True;recv.http_worker_ipc=None;recv.time_stats=None
++    namespace['handle_generate_request'](s,recv)
++    assert queued==[] and len(created)==len(outputs)==1
++    assert outputs[0].status==HTTPStatus.CONFLICT and 'retired target' in outputs[0].abort_message
++
++
++def test_native_target_header_survives_typed_gateway_body_filtering(monkeypatch):
++    import json
++    _,_,_,_,_,tag=fixture(monkeypatch)
++    obj=front_input(None)
++    guard.bind_native_target_header(obj,{'x-sglang-native-target':json.dumps(tag)})
++    guard.prepare_targeted_generate_input(obj)
++    assert obj.native_target==tag
++    other=deepcopy(tag);other['policy_version']='2'
++    with pytest.raises(ValueError,match='disagree'):
++        guard.bind_native_target_header(obj,{'x-sglang-native-target':json.dumps(other)})
++    with pytest.raises(ValueError,match='bound'):
++        guard.bind_native_target_header(obj,{'x-sglang-native-target':'x'*4097})

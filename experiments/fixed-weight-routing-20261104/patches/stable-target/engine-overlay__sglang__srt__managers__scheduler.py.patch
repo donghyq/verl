@@ -1,0 +1,22 @@
+--- a/engine-overlay/sglang/srt/managers/scheduler.py
++++ b/engine-overlay/sglang/srt/managers/scheduler.py
+@@ -2474,6 +2474,19 @@
+         self,
+         recv_req: TokenizedGenerateReqInput,
+     ):
++        if getattr(recv_req, "native_target", None) is not None:
++            from sglang.srt.managers.native_target_guard import check_native_target_before_admission
++            target_error = check_native_target_before_admission(self, recv_req)
++            if target_error is not None:
++                req = Req(recv_req.rid, recv_req.input_text, recv_req.input_ids, recv_req.sampling_params,
++                          return_logprob=recv_req.return_logprob, stream=recv_req.stream,
++                          vocab_size=self.model_config.vocab_size, http_worker_ipc=recv_req.http_worker_ipc,
++                          time_stats=recv_req.time_stats)
++                req.tokenizer = self.tokenizer
++                prepare_abort(req, target_error, status_code=HTTPStatus.CONFLICT)
++                self.output_streamer.stream_output([req], req.return_logprob)
++                return
++
+         # Route: normal request / session request / session-not-found
+         session_id = (
+             recv_req.session_params.id if recv_req.session_params is not None else None

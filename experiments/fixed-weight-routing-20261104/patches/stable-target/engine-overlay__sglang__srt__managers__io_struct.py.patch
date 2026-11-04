@@ -1,0 +1,18 @@
+--- a/engine-overlay/sglang/srt/managers/io_struct.py
++++ b/engine-overlay/sglang/srt/managers/io_struct.py
+@@ -939,6 +939,7 @@
+         )
+         cache[i] = sub
+         return sub
++    native_target: Optional[Dict[str, Any]] = None
+ 
+ 
+ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
+@@ -1055,6 +1056,7 @@
+         self.mm_inputs = unwrap_from_pickle(self.mm_inputs)
+         self.mm_data_mooncake = unwrap_from_pickle(self.mm_data_mooncake)
+         self.time_stats = unwrap_from_pickle(self.time_stats)
++    native_target: Optional[Dict[str, Any]] = None
+ 
+ 
+ class BatchTokenizedGenerateReqInput(BaseBatchReq, kw_only=True):

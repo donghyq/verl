@@ -1,0 +1,15 @@
+--- a/engine-overlay/sglang/srt/entrypoints/http_server.py
++++ b/engine-overlay/sglang/srt/entrypoints/http_server.py
+@@ -894,6 +894,12 @@
+ )
+ async def generate_request(obj: GenerateReqInput, request: Request):
+     """Handle a generate request."""
++    if "x-sglang-native-target" in request.headers:
++        from sglang.srt.managers.native_target_guard import bind_native_target_header
++        try:
++            bind_native_target_header(obj, request.headers)
++        except ValueError as error:
++            return _create_error_response(error)
+     if envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get():
+         apply_header_overrides(obj, request.headers)
+     if obj.stream:

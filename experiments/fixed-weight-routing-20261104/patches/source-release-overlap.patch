@@ -1,0 +1,733 @@
+--- a/tests/trainer/ppo/v1/test_trajectory_handoff_controller_on_cpu.py
++++ b/tests/trainer/ppo/v1/test_trajectory_handoff_controller_on_cpu.py
+@@ -410,7 +410,7 @@
+             manager.trajectory_coordinator.get_active_published_policy = published_policy
+             results = await manager.recover_trajectory_handoffs(timeout_s=2)
+             assert len(results) == 1 and results[0]["status"] == "resumed"
+-            assert results[0]["source_worker_index"] is None and results[0]["target_worker_index"] == 0
++            assert results[0]["source_worker_index"] == 0 and results[0]["target_worker_index"] == 1
+             assert len(resume_calls) == 1
+         finally:
+             coordinator.close()
+--- a/tests/trainer/ppo/v1/test_trajectory_shared_gpu_on_cpu.py
++++ b/tests/trainer/ppo/v1/test_trajectory_shared_gpu_on_cpu.py
+@@ -75,8 +75,9 @@
+ def test_trainer_sleeps_only_after_confirmed_original_uid_publication():
+     value = shared_trainer()
+     value.switch_to_trainer()
+-    assert value.events == ["remove", "native-routing-removed", "trajectory-settled", "hybrid_abort",
+-                            "hybrid_sleep", "admission-reopened"]
++    assert value.events == ["trajectory-settled", "remove", "native-routing-removed", "hybrid_abort",
++                            "hybrid_sleep"]
++    assert value._pending_trajectory_reclaim_receipt is not None
+     assert value.current_mode is HybridEngineMode.TRAINER
+     assert len(value.trajectory_resource_reclaims) == 1
+ 
+@@ -96,6 +97,7 @@
+     value, events = reclaim_manager()
+     value.agent_loop_workers[0].target.generate_sequences = lambda batch: events.append("source-admitted")
+     value.agent_loop_workers[1].target.generate_sequences = lambda batch: pytest.fail("reserved target admitted")
++    value._start_trajectory_completion_monitors = lambda prompts: None
+     monkeypatch.setattr(module.ray, "get", lambda futures: [asyncio.run(future) for future in futures])
+     # Record the selected actors without launching Ray or a model.
+     class Batch:
+@@ -111,7 +113,10 @@
+     value = shared_trainer()
+     value.llm_server_manager = SimpleNamespace(_continuous_publication_client=lambda: "coordinator")
+     copies = []
+-    value.checkpoint_manager.install_same_version_weights = lambda step, client: copies.append((step, client))
++    def install(step, client):
++        copies.append((step, client))
++        value.checkpoint_manager.resume_generation_replicas()
++    value.checkpoint_manager.install_same_version_weights = install
+     value.switch_to_rollout()
+     assert copies == [(value.global_steps, "coordinator")]
+     assert value.checkpoint_manager.update_calls == []
+--- a/verl/trainer/config/rollout/rollout.yaml
++++ b/verl/trainer/config/rollout/rollout.yaml
+@@ -204,6 +204,8 @@
+   enabled: False
+   continuous_policy_publication: False
+   shared_gpu_handoff: False
++  # Candidate: reclaim sources after durable release; wait for targets before weight publication.
++  overlap_handoff_with_training: False
+   handoff_target_worker_index: null
+   root_dir: null
+   run_id: null
+--- a/verl/trainer/ppo/v1/agent_loop_tq.py
++++ b/verl/trainer/ppo/v1/agent_loop_tq.py
+@@ -22,6 +22,7 @@
+ import os
+ import time
+ import traceback
++from copy import deepcopy
+ from dataclasses import replace
+ from typing import Any
+ from uuid import uuid4
+@@ -191,6 +192,8 @@
+         return {"background_tasks": pending, "active_groups": active,
+                 "group_uids": list(runtime._groups) if runtime is not None else [],
+                 "cleanup_pending": len(runtime._normal_cleanup_pending) if runtime is not None else 0,
++                "source_engine_url": getattr(getattr(self, "token_kv_source_backend", None), "engine_url", None),
++                "resume_engine_url": getattr(getattr(self, "token_kv_resume_backend", None), "engine_url", None),
+                 "errors": dict(self.trajectory_errors)}
+ 
+     async def resume_after_trajectory_reclaim(self):
+@@ -474,6 +477,8 @@
+         self._trajectory_checkpoint_paused = False
+         self._trajectory_reserved_target = None
+         self._trajectory_reclaim_receipt = None
++        self._trajectory_reclaim_targets_settled = None
++        self._trajectory_overlap_handoff = False
+         self._trajectory_controller = TrajectoryHandoffController(self)
+         super().__init__(*args, **kwargs)
+ 
+@@ -502,6 +507,7 @@
+             if len(self.agent_loop_workers) < 2 or not 0 <= target < len(self.agent_loop_workers):
+                 raise ValueError("shared GPU handoff requires a distinct reserved takeover worker")
+             self._trajectory_reserved_target = target
++        self._trajectory_overlap_handoff = settings.overlap_handoff_with_training
+         from .trajectory_state import RayTrajectoryCoordinatorClient, create_ray_trajectory_coordinator_actor
+ 
+         # A duplicate live coordinator for the same run fails closed. Ray may
+@@ -758,9 +764,86 @@
+         ])
+         self._trajectory_checkpoint_paused = False
+ 
++    @staticmethod
++    def _trajectory_workers_quiet(workers):
++        return all(not any(row[key] for key in
++                   ("background_tasks", "active_groups", "cleanup_pending")) for row in workers)
++
++    def _trajectory_controls_pending(self):
++        pending = []
++        for operation in self._trajectory_controller._operations.values():
++            if operation.task.done():
++                if operation.task.cancelled():
++                    raise TrajectoryControlError("reclaim_control_failed", uid=operation.uid)
++                error = operation.task.exception()
++                if error is not None:
++                    raise TrajectoryControlError("reclaim_control_failed", uid=operation.uid) from error
++            else:
++                pending.append(operation)
++        return pending
++
++    @staticmethod
++    def _trajectory_all_settled(summary):
++        return (not summary["active_execution_leases"] and not summary["unsettled_publications"]
++                and not summary["policy_publication_blocked"] and not summary["handoff_policy_barrier"]
++                and all(state == "finished" for state in summary["handoffs"].values()))
++
++    def _trajectory_sources_settled(self, workers, summary, target, hybrid_urls, standalone_urls):
++        # These URLs come from the Trainer's allocated replica pools, while the
++        # worker reports its actual direct source/resume backends. Never infer
++        # independence from a different worker index alone.
++        def normalized(url):
++            if not isinstance(url, str) or not url:
++                raise TrajectoryControlError("reclaim_topology_unconfirmed")
++            return (url if url.startswith(("http://", "https://")) else "http://" + url).rstrip("/")
++
++        if not hybrid_urls or not standalone_urls:
++            raise TrajectoryControlError("reclaim_topology_unconfirmed")
++        hybrid = {normalized(url) for url in hybrid_urls}
++        standalone = {normalized(url) for url in standalone_urls}
++        target_url = normalized(workers[target].get("resume_engine_url"))
++        if hybrid & standalone or target_url not in standalone:
++            raise TrajectoryControlError("reclaim_topology_unconfirmed")
++        # Pending members and later tool turns use this target's source backend.
++        if normalized(workers[target].get("source_engine_url")) != target_url:
++            raise TrajectoryControlError("reclaim_topology_unconfirmed")
++        for row in workers:
++            if normalized(row.get("source_engine_url")) not in hybrid | standalone:
++                raise TrajectoryControlError("reclaim_topology_unconfirmed")
++        target_owners = [owner for owner, index in self.trajectory_worker_owner_ids.items() if index == target]
++        counts = summary.get("active_execution_leases_by_owner")
++        if (len(target_owners) != 1 or not isinstance(counts, dict)
++                or any(type(count) is not int or count < 0 for count in counts.values())
++                or sum(counts.values()) != summary["active_execution_leases"]):
++            raise TrajectoryControlError("reclaim_source_leases_unconfirmed")
++        if any(count for owner, count in counts.items() if owner != target_owners[0]):
++            return False
++        if (not self._trajectory_workers_quiet([row for i, row in enumerate(workers) if i != target])
++                or summary["policy_publication_blocked"] or summary["handoff_policy_barrier"]):
++            return False
++        # Every unfinished durable group must belong to a single-flight target
++        # dispatch with its committed source-release proof. Unobserved work
++        # never authorizes physical memory release.
++        operations = {operation.handoff_id: operation
++                      for operation in self._trajectory_controller._operations.values()
++                      if operation.handoff_id is not None}
++        for handoff_id, state in summary["handoffs"].items():
++            if state == "finished":
++                continue
++            operation = operations.get(handoff_id)
++            if (state not in {"committed", "restoring"} or operation is None
++                    or not operation.dispatched or operation.source_release_receipt is None
++                    or operation.target_worker_index != target
++                    or operation.source_worker_index is None or operation.source_worker_index == target):
++                return False
++        return all(operation.dispatched and operation.source_release_receipt is not None
++                   and operation.target_worker_index == target
++                   for operation in self._trajectory_controls_pending())
++
+     @trajectory_control_api
+-    async def prepare_trajectory_resource_reclaim(self, *, timeout_s=None):
+-        """Publish every accepted group before permitting physical GPU reclamation."""
++    async def prepare_trajectory_resource_reclaim(self, *, timeout_s=None,
++                                                  hybrid_engine_urls=None, standalone_engine_urls=None):
++        """Quiesce sources; opt-in overlap leaves target work on standalone GPUs."""
+         target = getattr(self, "_trajectory_reserved_target", None)
+         if self.trajectory_coordinator is None or target is None:
+             raise TrajectoryControlError("shared_gpu_handoff_disabled")
+@@ -769,10 +852,12 @@
+         timeout = self._trajectory_controller._validate_timeout(
+             self.trajectory_control_timeout_s if timeout_s is None else timeout_s
+         )
++        overlap = getattr(self, "_trajectory_overlap_handoff", False)
+         self._trajectory_checkpoint_paused = True
++        self._trajectory_reclaim_targets_settled = None
+         deadline = time.monotonic() + timeout
+         originally_draining = set(self._draining_worker_indices)
+-        receipts = []
++        receipts = {}
+ 
+         async def settle():
+             await asyncio.gather(*[
+@@ -784,9 +869,11 @@
+                 ])
+                 if any(row["errors"] for row in workers):
+                     raise TrajectoryControlError("reclaim_worker_failed")
+-                # A separate takeover worker remains available while sources drain.
+-                # One durable policy barrier is held at a time; each receipt is
+-                # verified by the controller before the next source is signaled.
++                if overlap:
++                    # Check actual target placement before preempting any source.
++                    summary = await self.trajectory_coordinator_client.summary()
++                    self._trajectory_sources_settled(workers, summary, target,
++                                                     hybrid_engine_urls, standalone_engine_urls)
+                 for index, row in enumerate(workers):
+                     if index == target:
+                         continue
+@@ -794,21 +881,24 @@
+                         receipt = await self._trajectory_controller.run(
+                             uid, target_worker_index=target,
+                             timeout_s=max(.001, deadline - time.monotonic()),
++                            wait_for_source_release=overlap,
+                         )
+-                        if receipt["status"] not in {"resumed", "already_completed"}:
++                        if receipt["status"] not in {"source_released", "resumed", "already_completed"}:
+                             raise TrajectoryControlError("reclaim_handoff_unconfirmed", uid=uid)
+-                        receipts.append(receipt)
++                        receipts[uid] = receipt
+                 summary = await self.trajectory_coordinator_client.summary()
+-                controls = any(not operation.task.done()
+-                               for operation in self._trajectory_controller._operations.values())
+-                if (not controls and all(not any(row[key] for key in
+-                        ("background_tasks", "active_groups", "cleanup_pending")) for row in workers)
+-                        and not summary["active_execution_leases"] and not summary["unsettled_publications"]
+-                        and not summary["policy_publication_blocked"] and not summary["handoff_policy_barrier"]
+-                        and all(state == "finished" for state in summary["handoffs"].values())):
+-                    result = {"status": "quiesced", "operation_id": uuid4().hex, "receipts": receipts,
++                controls = self._trajectory_controls_pending()
++                all_settled = (not controls and self._trajectory_workers_quiet(workers)
++                               and self._trajectory_all_settled(summary))
++                sources_settled = overlap and self._trajectory_sources_settled(
++                    workers, summary, target, hybrid_engine_urls, standalone_engine_urls)
++                if all_settled or sources_settled:
++                    result = {"status": "quiesced", "operation_id": uuid4().hex,
++                              "receipts": list(receipts.values()), "target_completion_pending": not all_settled,
+                               "reopen_worker_indices": sorted(self._draining_worker_indices - originally_draining)}
+-                    self._trajectory_reclaim_receipt = result
++                    self._trajectory_reclaim_receipt = deepcopy(result)
++                    if all_settled:
++                        self._trajectory_reclaim_targets_settled = result["operation_id"]
+                     return result
+                 await asyncio.sleep(min(self.trajectory_status_poll_interval_s,
+                                         max(0, deadline - time.monotonic())))
+@@ -816,9 +906,38 @@
+         try:
+             return await asyncio.wait_for(settle(), timeout)
+         except asyncio.TimeoutError as error:
+-            # Admission stays closed. An uncertain target PUT must settle before
+-            # retry or memory release; timeout never authorizes sleep_replicas.
++            # Admission stays closed. A timeout never authorizes sleep_replicas.
+             raise TrajectoryControlError("reclaim_timeout") from error
++
++    @trajectory_control_api
++    async def wait_trajectory_resource_reclaim_targets(self, receipt, *, timeout_s=None):
++        """Finish the existing target tasks before publishing any new weights."""
++        if (not isinstance(receipt, dict) or receipt != getattr(self, "_trajectory_reclaim_receipt", None)
++                or not getattr(self, "_trajectory_checkpoint_paused", False)):
++            raise TrajectoryControlError("reclaim_not_quiesced")
++        if self._trajectory_reclaim_targets_settled == receipt["operation_id"]:
++            return
++        timeout = self._trajectory_controller._validate_timeout(
++            self.trajectory_control_timeout_s if timeout_s is None else timeout_s)
++
++        async def settle():
++            while True:
++                controls = self._trajectory_controls_pending()
++                workers = await asyncio.gather(*[
++                    worker.trajectory_checkpoint_status.remote() for worker in self.agent_loop_workers
++                ])
++                if any(row["errors"] for row in workers):
++                    raise TrajectoryControlError("reclaim_worker_failed")
++                summary = await self.trajectory_coordinator_client.summary()
++                if not controls and self._trajectory_workers_quiet(workers) and self._trajectory_all_settled(summary):
++                    self._trajectory_reclaim_targets_settled = receipt["operation_id"]
++                    return
++                await asyncio.sleep(self.trajectory_status_poll_interval_s)
++
++        try:
++            await asyncio.wait_for(settle(), timeout)
++        except asyncio.TimeoutError as error:
++            raise TrajectoryControlError("reclaim_target_timeout") from error
+ 
+     @trajectory_control_api
+     async def finish_trajectory_resource_reclaim(self, receipt):
+@@ -826,11 +945,14 @@
+         if (expected is None or receipt != expected or receipt.get("status") != "quiesced"
+                 or not getattr(self, "_trajectory_checkpoint_paused", False)):
+             raise TrajectoryControlError("reclaim_not_quiesced")
++        if self._trajectory_reclaim_targets_settled != expected["operation_id"]:
++            raise TrajectoryControlError("reclaim_targets_unfinished")
+         for index in expected["reopen_worker_indices"]:
+             await self.agent_loop_workers[index].resume_after_trajectory_reclaim.remote()
+             self._draining_worker_indices.discard(index)
+         await self.resume_trajectory_checkpoint_admission()
+         self._trajectory_reclaim_receipt = None
++        self._trajectory_reclaim_targets_settled = None
+ 
+     def generate_sequences(self, prompts: TensorDict) -> None:
+         """
+--- a/verl/trainer/ppo/v1/trainer_separate_async.py
++++ b/verl/trainer/ppo/v1/trainer_separate_async.py
+@@ -242,6 +242,19 @@
+             self.config, "actor_rollout_ref.rollout.trajectory_state.shared_gpu_handoff", default=False
+         ))
+ 
++    def _overlap_handoff_with_training(self):
++        return bool(OmegaConf.select(
++            self.config, "actor_rollout_ref.rollout.trajectory_state.overlap_handoff_with_training", default=False
++        ))
++
++    def _wait_for_trajectory_reclaim_targets(self):
++        receipt = getattr(self, "_pending_trajectory_reclaim_receipt", None)
++        if receipt is not None and (
++            self._overlap_handoff_with_training() or receipt.get("target_completion_pending", False)
++        ):
++            with marked_timer("trajectory_target_wait", self.timing_raw, color="yellow"):
++                self.agent_loop_manager.wait_trajectory_resource_reclaim_targets(receipt)
++
+     def _rollout_server_managers(self) -> list:
+         managers = super()._rollout_server_managers()
+         standalone = getattr(self, "standalone_server_manager", None)
+@@ -425,6 +438,9 @@
+             prepare_seconds = time.perf_counter() - prepare_start
+ 
+         with marked_timer("update_weights", self.timing_raw, color="red"):
++            # Compute may overlap target generation, but replica weight writes
++            # must wait for its complete-group publication and released leases.
++            self._wait_for_trajectory_reclaim_targets()
+             self._pending_sync_metrics = dict(
+                 self.standalone_checkpoint_manager.update_weights(self.global_steps) or {}
+             )
+@@ -451,6 +467,7 @@
+         """Install committed weights and make Hybrid replicas available for generation."""
+         if not self._enable_hybrid_replicas:
+             return
++        self._wait_for_trajectory_reclaim_targets()
+         if self._shared_gpu_handoff_enabled():
+             self.checkpoint_manager.install_same_version_weights(
+                 self.global_steps, self.llm_server_manager._continuous_publication_client()
+@@ -469,23 +486,34 @@
+             self._pending_trajectory_reclaim_receipt = None
+ 
+     def switch_to_trainer(self):
+-        """Settle accepted trajectories before removing Hybrid routing or memory."""
++        """Reclaim source GPUs only after their accepted work is durable and fenced."""
+         if not self._enable_hybrid_replicas:
+             return
+         receipt = None
++        routing_removed = False
+         if self._shared_gpu_handoff_enabled():
+             if getattr(self, "_pending_trajectory_reclaim_receipt", None) is not None:
+                 raise RuntimeError("previous shared-GPU reclaim has not reopened its confirmed rollout pool")
+-            # This closes new owner admission and settles/saves all already
+-            # accepted groups while their exact four-worker Gateway pool exists.
++            reclaim_kwargs = {}
++            if self._overlap_handoff_with_training():
++                # Target tool turns must not select a hybrid replica that is
++                # about to sleep. Existing direct source requests still drain.
++                self.remove_replicas_from_balancer()
++                self.checkpoint_manager.stop_generation_routing()
++                routing_removed = True
++                reclaim_kwargs = {
++                    "hybrid_engine_urls": self.llm_server_manager.server_addresses,
++                    "standalone_engine_urls": self.standalone_server_manager.server_addresses,
++                }
+             with marked_timer("trajectory_reclaim", self.timing_raw, color="cyan"):
+-                receipt = self.agent_loop_manager.prepare_trajectory_resource_reclaim()
++                receipt = self.agent_loop_manager.prepare_trajectory_resource_reclaim(**reclaim_kwargs)
+             if receipt.get("status") != "quiesced":
+-                raise RuntimeError("GPU reclamation requires confirmed trajectory publication")
++                raise RuntimeError("GPU reclamation requires confirmed source quiescence")
+             self._pending_trajectory_reclaim_receipt = receipt
+-        self.remove_replicas_from_balancer()
+-        if receipt is not None:
+-            self.checkpoint_manager.stop_generation_routing()
++        if not routing_removed:
++            self.remove_replicas_from_balancer()
++            if receipt is not None:
++                self.checkpoint_manager.stop_generation_routing()
+         self.checkpoint_manager.abort_replicas(reject_request=True)
+         self.checkpoint_manager.sleep_replicas()
+         self.current_mode = HybridEngineMode.TRAINER
+--- a/verl/trainer/ppo/v1/trajectory_handoff_controller.py
++++ b/verl/trainer/ppo/v1/trajectory_handoff_controller.py
+@@ -49,6 +49,8 @@
+     dispatched: bool = False
+     terminal_status: str | None = None
+     error: BaseException | None = field(default=None, repr=False)
++    source_release_ready: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
++    source_release_receipt: dict | None = field(default=None, repr=False)
+ 
+ 
+ class TrajectoryHandoffController:
+@@ -196,6 +198,17 @@
+             if before_resume is not None:
+                 await before_resume(operation.uid, operation.handoff_id, source_index, target_index)
+             operation.dispatched = True
++            # This is a durable source milestone, not a completed training group.
++            # The same single-flight task continues target generation/publication.
++            if (handoff.get("source_released") is True
++                    and handoff.get("source_released_at") is not None
++                    and handoff.get("state") in {"committed", "restoring"}):
++                operation.source_release_receipt = {
++                    "status": "source_released", "uid": operation.uid,
++                    "operation_id": operation.operation_id, "handoff_id": operation.handoff_id,
++                    "source_worker_index": source_index, "target_worker_index": target_index,
++                }
++                operation.source_release_ready.set()
+             receipt = await self.manager.resume_trajectory_handoff(
+                 operation.handoff_id, target_worker_index=target_index
+             )
+@@ -236,6 +249,7 @@
+         # A dispatched operation outlives its caller. Consume a later exception
+         # while retaining the task/result for status queries and safe retries.
+         operation.task.add_done_callback(lambda task: None if task.cancelled() else task.exception())
++        operation.task.add_done_callback(lambda task: operation.source_release_ready.set())
+         self._operations[uid] = operation
+         return operation
+ 
+@@ -261,6 +275,7 @@
+         timeout_s: float | None,
+         source_worker_index: int | None = None,
+         require_active: bool = True,
++        wait_for_source_release: bool = False,
+     ) -> dict:
+         if not isinstance(uid, str) or not uid:
+             raise TrajectoryControlError("invalid_uid")
+@@ -283,6 +298,10 @@
+             # An explicit reclaim request must still initiate preemption once.
+             if require_active and not operation.task.done() and not operation.dispatched:
+                 await self._ensure_preempted(operation)
++            if wait_for_source_release:
++                await operation.source_release_ready.wait()
++                if not operation.task.done():
++                    return dict(operation.source_release_receipt)
+             return await asyncio.shield(operation.task)
+         try:
+             return await asyncio.wait_for(wait_for_result(), timeout)
+--- a/verl/trainer/ppo/v1/trajectory_state/coordinator.py
++++ b/verl/trainer/ppo/v1/trajectory_state/coordinator.py
+@@ -1274,10 +1274,15 @@
+ 
+     def summary(self) -> dict:
+         self._require_open()
++        leases_by_owner = {}
++        for trajectory_id, lease in self._leases.items():
++            if self._live_owner(trajectory_id):
++                leases_by_owner[lease.owner_id] = leases_by_owner.get(lease.owner_id, 0) + 1
+         return {
+             "run_id": self.run_id, "sequence": self._state["sequence"],
+             "root_dir": str(self.root.parent.resolve()),
+             "active_execution_leases": sum(self._live_owner(t) for t in self._leases),
++            "active_execution_leases_by_owner": leases_by_owner,
+             "handoffs": {key: row["state"] for key, row in self._state["handoffs"].items()},
+             "unsettled_publications": [key for key, row in self._state["handoffs"].items()
+                 if row.get("publication") is not None and row["publication"]["state"] != "PUBLISHED"],
+--- a/verl/workers/config/rollout.py
++++ b/verl/workers/config/rollout.py
+@@ -78,6 +78,7 @@
+     enabled: bool = False
+     continuous_policy_publication: bool = False
+     shared_gpu_handoff: bool = False
++    overlap_handoff_with_training: bool = False
+     handoff_target_worker_index: Optional[int] = None
+     root_dir: Optional[str] = None
+     run_id: Optional[str] = None
+@@ -95,6 +96,12 @@
+     token_kv_resume: dict = field(default_factory=dict)
+ 
+     def __post_init__(self):
++        if type(self.overlap_handoff_with_training) is not bool:
++            raise ValueError("overlap_handoff_with_training must be boolean")
++        if self.overlap_handoff_with_training and (
++            not self.shared_gpu_handoff or not self.token_kv_resume.get("enabled", False)
++        ):
++            raise ValueError("overlapping handoff requires shared GPU handoff and bound token-KV engines")
+         if self.shared_gpu_handoff:
+             if not self.enabled or not self.continuous_policy_publication:
+                 raise ValueError("shared GPU handoff requires durable state and continuous policy publication")
+--- /dev/null
++++ b/tests/trainer/ppo/v1/test_trajectory_reclaim_overlap_on_cpu.py
+@@ -0,0 +1,248 @@
++# Copyright 2026 Project B contributors
++# Licensed under the Apache License, Version 2.0.
++"""CPU concurrency/fault proof only: no model, physical GPU release or RL benefit."""
++import asyncio
++from types import SimpleNamespace
++
++import pytest
++import torch
++from tensordict import TensorDict, NonTensorData
++from test_trajectory_handoff_controller_on_cpu import (
++    FakeWorker, RemoteMethod, make_manager, make_runtime, start_mixed_source, wait_until,
++)
++from test_trajectory_publication_on_cpu import FakeQueue, MEMBERS, UID, original_tags
++from test_trajectory_shared_gpu_on_cpu import reclaim_manager, shared_trainer
++
++from verl.trainer.ppo.v1.trajectory_publication import publish_trajectory_group
++from verl.trainer.ppo.v1.trajectory_state import DurableTrajectoryCoordinator
++from verl.trainer.ppo.v1.trajectory_state.runtime import PromptGroupExecutionError
++from verl.trainer.ppo.v1.trajectory_handoff_controller import TrajectoryControlError
++from verl.trainer.ppo.v1.trainer_separate_async import HybridEngineMode
++from verl.workers.config.rollout import TrajectoryStateConfig
++
++HYBRID, STANDALONE = ["http://hybrid"], ["http://standalone"]
++
++
++def overlap_fields():
++    # Uniform CPU protocol fixture works with the host's TensorDict 0.7 too;
++    # it does not bypass the V1 runtime's >=0.10 ragged-construction guard.
++    rows = []
++    for index in range(8):
++        prompt, response = torch.tensor([101, 102]), torch.tensor([11, 12, 13])
++        rows.append(TensorDict({
++            "uid": NonTensorData(UID), "session_id": torch.tensor(index),
++            "prompts": prompt, "responses": response, "input_ids": torch.cat((prompt, response)),
++            "response_mask": torch.ones(3, dtype=torch.int64), "loss_mask": torch.ones(3, dtype=torch.int64),
++            "rollout_log_probs": torch.full((3,), -.2),
++        }, batch_size=[]))
++    return torch.stack(rows)
++
++
++def validate_overlap_fields(fields, members):
++    assert len(members) == 8 and list(fields.batch_size) == [8]
++    assert torch.equal(fields["session_id"], torch.arange(8))
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("fault", [None, "missing_release_proof", "persist_failed", "target_failed"])
++async def test_source_reclaim_does_not_wait_for_target_but_publication_does(tmp_path, fault):
++    coordinator = DurableTrajectoryCoordinator(str(tmp_path), "run")
++    source_task = None
++    target_release = asyncio.Event()
++    try:
++        source, target = make_runtime(coordinator), make_runtime(coordinator, owner="run/worker-1")
++        source_task, source_release = await start_mixed_source(source, uid=UID)
++        old_lease = source._groups[UID].members[2].lease
++        dispatched, paused, reopened = [], {}, []
++        queue = None
++
++        async def resume(handoff_id):
++            nonlocal queue
++            dispatched.append(handoff_id)
++
++            async def complete(index, *args):
++                await target_release.wait()
++                if fault == "target_failed":
++                    raise OSError("injected target execution failure")
++                return {"member_index": index}
++
++            result = await target.run_target(handoff_id, complete, complete)
++            assert [row["member_index"] for row in result.outputs] == list(range(8))
++
++            class QueueObservation:
++                calls = []
++
++                @property
++                def publication(self):
++                    return coordinator.get_publication(handoff_id)
++
++            queue = FakeQueue(QueueObservation())
++            return await publish_trajectory_group(
++                coordinator=target.client, handoff_id=handoff_id, members=MEMBERS,
++                fields=overlap_fields(), tags=original_tags(), partition_id="train",
++                validate_fields=validate_overlap_fields, tq_api=queue,
++            )
++
++        async def request(uid):
++            accepted = await source.request_preemption(uid)
++            source_release.set()
++            return accepted
++
++        workers = [
++            FakeWorker(request=request, status=source.group_status, resume=resume),
++            FakeWorker(request=lambda uid: False, status=target.group_status, resume=resume),
++        ]
++        for index, worker in enumerate(workers):
++            runtime = source if index == 0 else target
++            url = HYBRID[0] if index == 0 else STANDALONE[0]
++
++            def status(runtime=runtime, index=index, url=url):
++                return {"background_tasks": int(index == 0 and not source_task.done()),
++                        "active_groups": len(runtime._groups) + len(runtime._active_targets),
++                        "group_uids": list(runtime._groups), "cleanup_pending": 0, "errors": {},
++                        "source_engine_url": url, "resume_engine_url": url}
++
++            worker.trajectory_checkpoint_status = RemoteMethod(status)
++            worker.set_trajectory_checkpoint_paused = RemoteMethod(lambda flag, i=index: paused.update({i: flag}))
++            worker.resume_after_trajectory_reclaim = RemoteMethod(lambda i=index: reopened.append(i))
++        manager = make_manager(coordinator, workers)
++        manager._trajectory_reserved_target = 1
++        manager._trajectory_overlap_handoff = True
++        if fault == "persist_failed":
++            def fail_commit(handoff_id):
++                raise OSError("injected Manifest commit failure")
++            coordinator.commit_handoff_manifest = fail_commit
++            with pytest.raises(TrajectoryControlError):
++                await manager.prepare_trajectory_resource_reclaim(
++                    hybrid_engine_urls=HYBRID, standalone_engine_urls=STANDALONE, timeout_s=.1)
++            with pytest.raises(PromptGroupExecutionError, match="SOURCE_EXECUTION_FAILED"):
++                await source_task
++            assert dispatched == [] and queue is None
++            assert getattr(manager, "_trajectory_reclaim_receipt", None) is None
++            assert reopened == []
++            return
++        if fault == "missing_release_proof":
++            original_list = coordinator.list_recoverable_handoffs
++            coordinator.list_recoverable_handoffs = lambda: [
++                {k: v for k, v in row.items() if k not in {"source_released", "source_released_at"}}
++                for row in original_list()
++            ]
++            with pytest.raises(TrajectoryControlError):
++                await manager.prepare_trajectory_resource_reclaim(
++                    hybrid_engine_urls=HYBRID, standalone_engine_urls=STANDALONE, timeout_s=.1)
++            assert getattr(manager, "_trajectory_reclaim_receipt", None) is None
++            assert paused == {0: True, 1: True} and reopened == []
++            target_release.set()
++            await wait_until(lambda: bool(queue and queue.prompt_tag["status"] == "finished"))
++            return
++
++        receipt = await manager.prepare_trajectory_resource_reclaim(
++            hybrid_engine_urls=HYBRID, standalone_engine_urls=STANDALONE, timeout_s=2)
++        assert receipt["status"] == "quiesced" and receipt["target_completion_pending"] is True
++        await source_task
++        await wait_until(lambda: coordinator.summary()["active_execution_leases"] > 0)
++        assert coordinator.summary()["active_execution_leases_by_owner"] == {"run/worker-1": 6}
++        with pytest.raises(ValueError):
++            coordinator.check_trajectory_owner(old_lease)
++        assert queue is None and len(dispatched) == 1  # Incomplete group never published.
++        receipt["receipts"].append({"status": "forged"})
++        with pytest.raises(TrajectoryControlError, match="reclaim_not_quiesced"):
++            await manager.wait_trajectory_resource_reclaim_targets(receipt)
++        receipt["receipts"].pop()
++        with pytest.raises(TrajectoryControlError, match="reclaim_targets_unfinished"):
++            await manager.finish_trajectory_resource_reclaim(receipt)
++        with pytest.raises(TrajectoryControlError, match="reclaim_target_timeout"):
++            await manager.wait_trajectory_resource_reclaim_targets(receipt, timeout_s=.02)
++        assert (await manager.trajectory_operation_status(UID))["state"] == "dispatched"
++        assert len(dispatched) == 1 and reopened == []
++        target_release.set()
++        if fault == "target_failed":
++            with pytest.raises(TrajectoryControlError, match="reclaim_control_failed") as failed:
++                await manager.wait_trajectory_resource_reclaim_targets(receipt, timeout_s=2)
++            assert failed.value.__cause__.reason == "TARGET_EXECUTION_FAILED"
++            assert queue is None and reopened == [] and len(dispatched) == 1
++            return
++        await manager.wait_trajectory_resource_reclaim_targets(receipt, timeout_s=2)
++        assert queue.prompt_tag["status"] == "finished" and queue.put_calls == queue.prompt_put_calls == 1
++        assert list(coordinator.summary()["handoffs"].values()) == ["finished"]
++        await manager.finish_trajectory_resource_reclaim(receipt)
++        assert paused == {0: False, 1: False} and reopened == [0]
++        result = await manager.preempt_and_resume_trajectory(UID, target_worker_index=1, timeout_s=2)
++        assert result["status"] == "resumed" and len(dispatched) == 1
++    finally:
++        target_release.set()
++        if source_task is not None and not source_task.done():
++            source_task.cancel()
++            await asyncio.gather(source_task, return_exceptions=True)
++        coordinator.close()
++
++
++@pytest.mark.parametrize("fault", ["missing_topology", "target_on_hybrid", "unknown_source_lease", "policy_barrier"])
++def test_overlap_cannot_release_unconfirmed_sources(fault):
++    value, events = reclaim_manager()
++    value._trajectory_overlap_handoff = True
++    value.trajectory_worker_owner_ids = {"source": 0, "target": 1}
++    for index, worker in enumerate(value.agent_loop_workers):
++        original = worker.target.trajectory_checkpoint_status
++        url = HYBRID[0] if index == 0 or fault == "target_on_hybrid" else STANDALONE[0]
++        worker.target.trajectory_checkpoint_status = lambda original=original, url=url: {
++            **original(), "source_engine_url": url, "resume_engine_url": url}
++    value.trajectory_coordinator.target.summary = lambda: {
++        "active_execution_leases": int(fault == "unknown_source_lease"),
++        "active_execution_leases_by_owner": {"foreign-source": 1} if fault == "unknown_source_lease" else {},
++        "unsettled_publications": [], "handoffs": {},
++        "policy_publication_blocked": False, "handoff_policy_barrier": fault == "policy_barrier",
++    }
++    with pytest.raises(TrajectoryControlError):
++        value.prepare_trajectory_resource_reclaim(
++            hybrid_engine_urls=None if fault == "missing_topology" else HYBRID,
++            standalone_engine_urls=STANDALONE, timeout_s=.02)
++    assert value._trajectory_checkpoint_paused and "source-reopened" not in events
++    assert getattr(value, "_trajectory_reclaim_receipt", None) is None
++
++
++def overlap_trainer(*, target_fails=False):
++    value = shared_trainer()
++    value.config.actor_rollout_ref.rollout.trajectory_state.overlap_handoff_with_training = True
++    value.llm_server_manager = SimpleNamespace(server_addresses=HYBRID, _continuous_publication_client=lambda: None)
++    value.standalone_server_manager = SimpleNamespace(server_addresses=STANDALONE)
++
++    def prepare(**kwargs):
++        assert kwargs == {"hybrid_engine_urls": HYBRID, "standalone_engine_urls": STANDALONE}
++        assert value.events == ["remove", "native-routing-removed"]
++        value.events.append("source-released")
++        return {"status": "quiesced", "target_completion_pending": True}
++
++    def wait(receipt):
++        value.events.append("target-settled")
++        if target_fails:
++            raise TrajectoryControlError("reclaim_target_timeout")
++
++    value.agent_loop_manager.prepare_trajectory_resource_reclaim = prepare
++    value.agent_loop_manager.wait_trajectory_resource_reclaim_targets = wait
++    value.checkpoint_manager.install_same_version_weights = lambda *args: value.events.append("install-committed")
++    return value
++
++
++@pytest.mark.parametrize("target_fails", [False, True])
++def test_native_trainer_computes_before_target_wait_but_never_publishes_early(target_fails):
++    value = overlap_trainer(target_fails=target_fails)
++    value.switch_to_trainer()
++    assert value.current_mode is HybridEngineMode.TRAINER
++    assert value.events == ["remove", "native-routing-removed", "source-released", "hybrid_abort", "hybrid_sleep"]
++    value.events.append("actor-compute")
++    if target_fails:
++        with pytest.raises(TrajectoryControlError, match="reclaim_target_timeout"):
++            value.on_step_end()
++        assert value.standalone_checkpoint_manager.update_calls == []
++        assert "admission-reopened" not in value.events
++    else:
++        value.on_step_end()
++        assert value.events.index("actor-compute") < value.events.index("target-settled") < value.events.index("standalone_update")
++        assert value.events.index("install-committed") < value.events.index("admission-reopened")
++
++
++def test_overlap_config_is_opt_in_and_requires_bound_engines():
++    assert TrajectoryStateConfig().overlap_handoff_with_training is False
++    with pytest.raises(ValueError, match="overlapping handoff"):
++        TrajectoryStateConfig(overlap_handoff_with_training=True)

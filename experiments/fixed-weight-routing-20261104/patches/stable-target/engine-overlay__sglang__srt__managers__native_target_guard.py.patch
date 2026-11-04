@@ -1,0 +1,128 @@
+--- a/engine-overlay/sglang/srt/managers/native_target_guard.py
++++ b/engine-overlay/sglang/srt/managers/native_target_guard.py
+@@ -0,0 +1,125 @@
++# Copyright 2026 Project B contributors
++# Licensed under the Apache License, Version 2.0.
++"""Opt-in stable native target checks before admission; no worker selection."""
++from __future__ import annotations
++
++from copy import deepcopy
++import os
++import json
++from types import SimpleNamespace
++
++
++def validate_target_shape(value):
++    expected = {'schema_version', 'policy_version', 'query_digest', 'rank_generations', 'minimum_device_prefix'}
++    if not isinstance(value, dict) or set(value) != expected or type(value['schema_version']) is not int or value['schema_version'] != 1:
++        raise ValueError('invalid native target schema')
++    version = value['policy_version']
++    if (not isinstance(version,str) or not version.isascii() or not version.isdecimal()
++            or len(version)>20 or version != str(int(version))):
++        raise ValueError('native target requires the committed nonnegative policy version')
++    digest = value['query_digest']
++    if not isinstance(digest,str) or len(digest)!=64 or any(c not in '0123456789abcdef' for c in digest):
++        raise ValueError('invalid native target request digest')
++    ranks = value['rank_generations']
++    if (not isinstance(ranks,dict) or not 1<=len(ranks)<=8
++            or set(ranks)!={str(rank) for rank in range(len(ranks))}):
++        raise ValueError('native target requires every contiguous TP rank')
++    for row in ranks.values():
++        if not isinstance(row,dict) or set(row)!={'engine_instance_id','cache_generation'}:
++            raise ValueError('invalid native rank target')
++        instance,generation = row['engine_instance_id'],row['cache_generation']
++        if (not isinstance(instance,str) or not 0<len(instance)<=256 or not isinstance(generation,str)
++                or len(generation)!=64 or any(c not in '0123456789abcdef' for c in generation)):
++            raise ValueError('invalid native target generation')
++    minimum=value['minimum_device_prefix']
++    if type(minimum) is not int or not 0<=minimum<32768:
++        raise ValueError('invalid minimum native device prefix')
++    return deepcopy(value)
++
++
++def prepare_targeted_generate_input(obj):
++    value=getattr(obj,'native_target',None)
++    if value is None:return
++    if os.environ.get('SGLANG_ENABLE_STABLE_NATIVE_TARGET')!='1':
++        raise ValueError('stable native generation targets are disabled')
++    if not obj.is_single:
++        raise ValueError('targeted generation v1 accepts one token-ID request')
++    if (getattr(obj,'text',None) is not None or not isinstance(obj.input_ids,list)
++            or not 1<=len(obj.input_ids)<=32768
++            or any(type(token) is not int or not 0<=token<2**31 for token in obj.input_ids)):
++        raise ValueError('targeted generation requires bounded exact token IDs')
++    if any(getattr(obj,key,None) is not None for key in (
++            'input_embeds','positional_embed_overrides','image_data','lora_path','extra_key',
++            'session_params','session_id','token_kv_restore')):
++        raise ValueError('targeted generation v1 requires plain text without sessions/restore')
++    if getattr(obj,'return_logprob',False) and getattr(obj,'logprob_start_len',-1)!=-1:
++        raise ValueError('targeted generation cannot change the native cache-match cap')
++    obj.native_target=validate_target_shape(value)
++
++
++def _actual_weight_version():
++    from sglang.srt.runtime_context import get_serving
++    return get_serving().weight_version
++
++
++def _inspect_prefix(manager,request,version):
++    from sglang.srt.mem_cache.native_cache_directory import inspect_cache_prefix
++    return inspect_cache_prefix(manager,request,weight_version=version)
++
++
++def _gather_checks(scheduler,local):
++    if scheduler.ps.tp_size==1:return [local]
++    import torch
++    rows=[None]*scheduler.ps.tp_size
++    # One rank rejecting alone would let peers enter a different forward path.
++    torch.distributed.all_gather_object(rows,local,group=scheduler.tp_cpu_group)
++    return rows
++
++
++def check_native_target_before_admission(scheduler,recv_req):
++    raw=getattr(recv_req,'native_target',None)
++    if raw is None:return None
++    local={'tp_rank':scheduler.ps.tp_rank,'status':'FAILED'}
++    try:
++        if os.environ.get('SGLANG_ENABLE_STABLE_NATIVE_TARGET')!='1':
++            raise ValueError('stable native generation targets are disabled')
++        target=validate_target_shape(raw)
++        if len(target['rank_generations'])!=scheduler.ps.tp_size:
++            raise ValueError('target TP membership differs from the engine')
++        manager=getattr(scheduler,'token_kv_snapshot_manager',None)
++        if manager is None:
++            raise ValueError('native target has no current observed engine identity')
++        failures=manager._check_runtime()
++        if failures:raise ValueError('; '.join(failures))
++        tokens=list(recv_req.input_ids)
++        request=SimpleNamespace(expected_weight_version=target['policy_version'],cache_query={
++            'token_ids':tokens,'cache_salt':recv_req.cache_salt,'query_digest':target['query_digest'],
++            'expected_rank_generations':target['rank_generations']})
++        proof=_inspect_prefix(manager,request,_actual_weight_version())
++        if proof['native_complete_device_prefix']<target['minimum_device_prefix']:
++            raise ValueError('required native device prefix was evicted before admission')
++        local.update(status='PASS')
++    except Exception as error:
++        local['reason']=type(error).__name__+': '+str(error)[:300]
++    rows=_gather_checks(scheduler,local)
++    if (len(rows)!=scheduler.ps.tp_size or any(not isinstance(r,dict) or type(r.get('tp_rank')) is not int for r in rows)
++            or {r['tp_rank'] for r in rows}!=set(range(scheduler.ps.tp_size))):
++        return 'native_target_rejected_before_admission: incomplete TP agreement'
++    failed=[r for r in rows if r.get('status')!='PASS']
++    if failed:
++        return 'native_target_rejected_before_admission: '+ '; '.join(
++            f"rank{r['tp_rank']} {r.get('reason','rejected')}" for r in failed)[:1200]
++    return None
++
++
++def bind_native_target_header(obj, headers):
++    raw=headers.get('x-sglang-native-target')
++    if raw is None:return
++    if not isinstance(raw,str) or len(raw.encode())>4096:
++        raise ValueError('native target header exceeds the bound')
++    try:target=validate_target_shape(json.loads(raw))
++    except (ValueError,TypeError) as error:raise ValueError('invalid native target header') from error
++    existing=getattr(obj,'native_target',None)
++    if existing is not None and existing!=target:
++        raise ValueError('native target body and header disagree')
++    obj.native_target=target

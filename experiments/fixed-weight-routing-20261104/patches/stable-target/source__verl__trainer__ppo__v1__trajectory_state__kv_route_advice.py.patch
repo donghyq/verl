@@ -1,0 +1,16 @@
+--- a/source/verl/trainer/ppo/v1/trajectory_state/kv_route_advice.py
++++ b/source/verl/trainer/ppo/v1/trajectory_state/kv_route_advice.py
+@@ -246,6 +246,13 @@
+                         "estimated_seconds": cost, "uncertainty_seconds": _number(row["uncertainty_seconds"]),
+                         "declared_device_prefix": device, "declared_host_prefix": host,
+                     }
++                    if self.directory_source == "native_prefix_probe":
++                        result["candidates"][instance_id]["native_target"] = {
++                            "schema_version": 1, "policy_version": str(identity["policy_version"]),
++                            "query_digest": proof["query_digest"],
++                            "rank_generations": deepcopy(proof["rank_generations"]),
++                            "minimum_device_prefix": device,
++                        }
+                 except (KeyError, TypeError, ValueError):
+                     continue  # A malformed candidate cannot authorize advice.
+             if len(result["candidates"]) < 2:

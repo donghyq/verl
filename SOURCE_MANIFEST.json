@@ -105,6 +105,26 @@
       "scope": "SyntheticMoEcurrentnativeGPUfunctionalCLIonly",
       "AI_assisted": true,
       "human_line_review": "PENDING"
+    },
+    "routing_gpu_snapshot_20261104": {
+      "kind": "sha_verified_executed_files",
+      "scope": "fixed-weight 35B component screen, not dynamic-training integration or performance acceptance",
+      "execution_source_manifest_sha256": "4c26b2bec84b5249501fe307a10e17c11102654ecd149197f2b9c12e05b3f321"
+    },
+    "routing_cpu_tests_20261104": {
+      "kind": "cpu_test_source",
+      "scope": "CPU fixture checks for bounded routing; no GPU or RL claim"
+    },
+    "project_b_candidates_20261103_04": {
+      "kind": "private_candidate_patches",
+      "scope": "isolated SGLang, Gateway and trainer candidates; different baselines and proof levels"
+    },
+    "routing_result_summary_20261104": {
+      "kind": "sanitized_evidence_summary",
+      "scope": "fixed-weight component screen and descriptive old training pair; raw private receipts not published",
+      "source_report_sha256": "43841262a061b8aae4c0962c0843078af8fa515286b51f380767456456e2de17",
+      "quality_report_sha256": "31ab4eb0e8c42f4d757c3ff5cab470fb0bc83a7329336aefa98812f589a8c599",
+      "training_pair_report_sha256": "8ed3aeaa7169fcca1546ca49f70176c5f7a468b8a6520d455b162af6f02aa37f"
     }
   },
   "files": [
@@ -131,18 +151,22 @@
       "source": "review_catalog",
       "source_path": "README.md",
       "source_sha256": "4491e07047ddfc82ac87506b41c87af02a692f22c8ccb4001524cc2c220fcfd9",
-      "public_sha256": "4491e07047ddfc82ac87506b41c87af02a692f22c8ccb4001524cc2c220fcfd9",
-      "bytes": 4682,
-      "normalizations": []
+      "public_sha256": "202366fb69f30a297c13a3a3b76930d7bbd9819583259e15270a0583f0b794a9",
+      "bytes": 5086,
+      "normalizations": [
+        "added verified 2026-11-04 evidence summary"
+      ]
     },
     {
       "path": "REVIEW_STATUS.md",
       "source": "review_catalog",
       "source_path": "REVIEW_STATUS.md",
       "source_sha256": "5191d8d689406ed9cc62c1a8159831d8b5c279a4131ef3d1f326a79dc8961d1b",
-      "public_sha256": "5191d8d689406ed9cc62c1a8159831d8b5c279a4131ef3d1f326a79dc8961d1b",
-      "bytes": 4394,
-      "normalizations": []
+      "public_sha256": "8f8f5df3a83dbbbe5aa12f91ccbcce89de535ca36142d388a7bcf506c67ce3e9",
+      "bytes": 4900,
+      "normalizations": [
+        "added verified 2026-11-04 evidence summary"
+      ]
     },
     {
       "path": "THIRD_PARTY_NOTICES.md",
@@ -9526,6 +9550,289 @@
       "public_sha256": "9d770f9e0bd4528933d49de765c84588b18ff04a190e7d3ea95b42b5ff75ec79",
       "bytes": 4004,
       "normalizations": []
+    },
+    {
+      "path": "experiments/fixed-weight-routing-20261104/driver/screen.py",
+      "source": "routing_gpu_snapshot_20261104",
+      "source_path": "routing-screen-fallback-20261104/artifacts/screen.py",
+      "source_sha256": "ef935d292641881ceeb6493c18e1147a5ebfbab5ece9d070f24631380f7a20de",
+      "public_sha256": "ef935d292641881ceeb6493c18e1147a5ebfbab5ece9d070f24631380f7a20de",
+      "bytes": 16913,
+      "normalizations": []
+    },
+    {
+      "path": "experiments/fixed-weight-routing-20261104/driver/screen_driver.py",
+      "source": "routing_gpu_snapshot_20261104",
+      "source_path": "routing-screen-fallback-20261104/artifacts/screen_driver.py",
+      "source_sha256": "e5c64038b19c1dcb54d3930a93020e3b839259498b73c63884266b8d7a5d376b",
+      "public_sha256": "e5c64038b19c1dcb54d3930a93020e3b839259498b73c63884266b8d7a5d376b",
+      "bytes": 11464,
+      "normalizations": []
+    },
+    {
+      "path": "experiments/fixed-weight-routing-20261104/driver/screen_window.py",
+      "source": "routing_gpu_snapshot_20261104",
+      "source_path": "routing-screen-fallback-20261104/artifacts/screen_window.py",
+      "source_sha256": "167b2df80ddf0fca0583dbe6610a3d296914b9f481539b13cb17877e949da0b3",
+      "public_sha256": "167b2df80ddf0fca0583dbe6610a3d296914b9f481539b13cb17877e949da0b3",
+      "bytes": 12131,
+      "normalizations": []
+    },
+    {
+      "path": "experiments/fixed-weight-routing-20261104/driver/commands.py",
+      "source": "routing_gpu_snapshot_20261104",
+      "source_path": "routing-screen-fallback-20261104/artifacts/commands.py",
+      "source_sha256": "7a5a0d718679f8b831cea1bd7509c8ec4d92eccc1618702f71ac50c50373a0f5",
+      "public_sha256": "7a5a0d718679f8b831cea1bd7509c8ec4d92eccc1618702f71ac50c50373a0f5",
+      "bytes": 1452,
+      "normalizations": []
+    },
+    {
+      "path": "experiments/fixed-weight-routing-20261104/driver/gateway_readiness.py",
+      "source": "routing_gpu_snapshot_20261104",
+      "source_path": "routing-screen-fallback-20261104/artifacts/gateway_readiness.py",
+      "source_sha256": "ed348310640da01f2da7966cf5d33fe2c601d8dfb736ac1e5bb76db771134755",
+      "public_sha256": "ed348310640da01f2da7966cf5d33fe2c601d8dfb736ac1e5bb76db771134755",
+      "bytes": 1228,
+      "normalizations": []
+    },
+    {
+      "path": "experiments/fixed-weight-routing-20261104/driver/observed_directory.py",
+      "source": "routing_gpu_snapshot_20261104",
+      "source_path": "routing-screen-fallback-20261104/artifacts/observed_directory.py",
+      "source_sha256": "4982d514b79f80ab333adb1891168c5479e7324b6d348b90d7235d59b1f99efc",
+      "public_sha256": "4982d514b79f80ab333adb1891168c5479e7324b6d348b90d7235d59b1f99efc",
+      "bytes": 1803,
+      "normalizations": []
+    },
+    {
+      "path": "experiments/fixed-weight-routing-20261104/driver/candidate_entry.py",
+      "source": "routing_gpu_snapshot_20261104",
+      "source_path": "routing-screen-fallback-20261104/artifacts/candidate_entry.py",
+      "source_sha256": "f2c797698e7e6b3c22ce41c7902982b4fc09f58bb8af4bed7a4c556d15893eea",
+      "public_sha256": "f2c797698e7e6b3c22ce41c7902982b4fc09f58bb8af4bed7a4c556d15893eea",
+      "bytes": 3621,
+      "normalizations": []
+    },
+    {
+      "path": "experiments/fixed-weight-routing-20261104/driver/candidate/__init__.py",
+      "source": "routing_gpu_snapshot_20261104",
+      "source_path": "routing-screen-fallback-20261104/artifacts/candidate/__init__.py",
+      "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "public_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "normalizations": []
+    },
+    {
+      "path": "experiments/fixed-weight-routing-20261104/driver/candidate/conductor_hint_client.py",
+      "source": "routing_gpu_snapshot_20261104",
+      "source_path": "routing-screen-fallback-20261104/artifacts/candidate/conductor_hint_client.py",
+      "source_sha256": "80bbc2dbd6ddc9288c0c81849c00c5d9b0bea8ff9db184d6c2e2feea1a5c3dfd",
+      "public_sha256": "80bbc2dbd6ddc9288c0c81849c00c5d9b0bea8ff9db184d6c2e2feea1a5c3dfd",
+      "bytes": 4407,
+      "normalizations": []
+    },
+    {
+      "path": "experiments/fixed-weight-routing-20261104/driver/candidate/identity.py",
+      "source": "routing_gpu_snapshot_20261104",
+      "source_path": "routing-screen-fallback-20261104/artifacts/candidate/identity.py",
+      "source_sha256": "ff2d5fc17bf1fb9e642cfb1295f2d42a82a9203e95b65817bd46ef70a4a544cf",
+      "public_sha256": "ff2d5fc17bf1fb9e642cfb1295f2d42a82a9203e95b65817bd46ef70a4a544cf",
+      "bytes": 3540,
+      "normalizations": []
+    },
+    {
+      "path": "experiments/fixed-weight-routing-20261104/driver/candidate/kv_route_advice.py",
+      "source": "routing_gpu_snapshot_20261104",
+      "source_path": "routing-screen-fallback-20261104/artifacts/candidate/kv_route_advice.py",
+      "source_sha256": "36a97eb3f1c2086bdca9fe45047fa421bd597d61ffa449d7f1f97203db173f19",
+      "public_sha256": "36a97eb3f1c2086bdca9fe45047fa421bd597d61ffa449d7f1f97203db173f19",
+      "bytes": 22028,
+      "normalizations": []
+    },
+    {
+      "path": "experiments/fixed-weight-routing-20261104/driver/candidate/native_cache_directory_client.py",
+      "source": "routing_gpu_snapshot_20261104",
+      "source_path": "routing-screen-fallback-20261104/artifacts/candidate/native_cache_directory_client.py",
+      "source_sha256": "f7c5fbc2bd22abeb45dca7d68de9cbcbddedf12bcff57c3c9d48d29d9b51b859",
+      "public_sha256": "f7c5fbc2bd22abeb45dca7d68de9cbcbddedf12bcff57c3c9d48d29d9b51b859",
+      "bytes": 8116,
+      "normalizations": []
+    },
+    {
+      "path": "experiments/fixed-weight-routing-20261104/driver/candidate/policy_publication.py",
+      "source": "routing_gpu_snapshot_20261104",
+      "source_path": "routing-screen-fallback-20261104/artifacts/candidate/policy_publication.py",
+      "source_sha256": "5631c53b46f81c4b0f9779e434a3a873de504b51ee7ac8b5fb819b302ca62178",
+      "public_sha256": "5631c53b46f81c4b0f9779e434a3a873de504b51ee7ac8b5fb819b302ca62178",
+      "bytes": 10833,
+      "normalizations": []
+    },
+    {
+      "path": "experiments/fixed-weight-routing-20261104/driver/test_bounded_routing.py",
+      "source": "routing_cpu_tests_20261104",
+      "source_path": "routing-screen-fallback-20261104/test_bounded_routing.py",
+      "source_sha256": "ce85716dae487e9cfde07644a95e9986cd67b8abca8c41c67265ba7f94761054",
+      "public_sha256": "ce85716dae487e9cfde07644a95e9986cd67b8abca8c41c67265ba7f94761054",
+      "bytes": 6114,
+      "normalizations": []
+    },
+    {
+      "path": "experiments/fixed-weight-routing-20261104/driver/test_screen.py",
+      "source": "routing_cpu_tests_20261104",
+      "source_path": "routing-screen-fallback-20261104/test_screen.py",
+      "source_sha256": "d63d2650d9e719b834f1e65f430b591f43383848a7f197204a0ce7c7a0abc6be",
+      "public_sha256": "d63d2650d9e719b834f1e65f430b591f43383848a7f197204a0ce7c7a0abc6be",
+      "bytes": 8702,
+      "normalizations": []
+    },
+    {
+      "path": "experiments/fixed-weight-routing-20261104/driver/test_readiness.py",
+      "source": "routing_cpu_tests_20261104",
+      "source_path": "routing-screen-fallback-20261104/test_readiness.py",
+      "source_sha256": "7fd64e55dc15c4701d43a9b6110ed88ebc77399c19803e675848b00d3c778b35",
+      "public_sha256": "7fd64e55dc15c4701d43a9b6110ed88ebc77399c19803e675848b00d3c778b35",
+      "bytes": 1481,
+      "normalizations": []
+    },
+    {
+      "path": "experiments/fixed-weight-routing-20261104/patches/prefill-checkpoint.patch",
+      "source": "project_b_candidates_20261103_04",
+      "source_path": "prefill-checkpoint-candidate-20261104/checkpoint-origin.patch",
+      "source_sha256": "f3a88609000de6384b77db645791f6b5efb5534903d80bdc6ca21448acd1cb0b",
+      "public_sha256": "f3a88609000de6384b77db645791f6b5efb5534903d80bdc6ca21448acd1cb0b",
+      "bytes": 2614,
+      "normalizations": []
+    },
+    {
+      "path": "experiments/fixed-weight-routing-20261104/patches/native-directory.patch",
+      "source": "project_b_candidates_20261103_04",
+      "source_path": "kv-native-directory-candidate-20261103/native-directory.patch",
+      "source_sha256": "40bd3e98a3ae110cb163781a8f5a6d69d17baff52561fb4a5b0b8e83ffc3efda",
+      "public_sha256": "40bd3e98a3ae110cb163781a8f5a6d69d17baff52561fb4a5b0b8e83ffc3efda",
+      "bytes": 43542,
+      "normalizations": []
+    },
+    {
+      "path": "experiments/fixed-weight-routing-20261104/patches/source-release-overlap.patch",
+      "source": "project_b_candidates_20261103_04",
+      "source_path": "positive-benefit-candidate-20261103/source-reclaim-overlap.patch",
+      "source_sha256": "ca879e6e6564f5acfbb7ca0afe491bfb0b5edc0d6a780383fba05a74005c973d",
+      "public_sha256": "ca879e6e6564f5acfbb7ca0afe491bfb0b5edc0d6a780383fba05a74005c973d",
+      "bytes": 41152,
+      "normalizations": []
+    },
+    {
+      "path": "experiments/fixed-weight-routing-20261104/patches/stable-target/engine-overlay__sglang__srt__entrypoints__http_server.py.patch",
+      "source": "project_b_candidates_20261103_04",
+      "source_path": "stable-target-candidate-20261103/patches/engine-overlay__sglang__srt__entrypoints__http_server.py.patch",
+      "source_sha256": "0f9537ecc4bdf3891a1350ce00d5189fc4c6b5f7a1d233e702bdfd611c70bc71",
+      "public_sha256": "0f9537ecc4bdf3891a1350ce00d5189fc4c6b5f7a1d233e702bdfd611c70bc71",
+      "bytes": 685,
+      "normalizations": []
+    },
+    {
+      "path": "experiments/fixed-weight-routing-20261104/patches/stable-target/engine-overlay__sglang__srt__managers__io_struct.py.patch",
+      "source": "project_b_candidates_20261103_04",
+      "source_path": "stable-target-candidate-20261103/patches/engine-overlay__sglang__srt__managers__io_struct.py.patch",
+      "source_sha256": "8da454285893f2c0f39e339a48bc6112947aecf665711f679481880ce7b8e699",
+      "public_sha256": "8da454285893f2c0f39e339a48bc6112947aecf665711f679481880ce7b8e699",
+      "bytes": 640,
+      "normalizations": []
+    },
+    {
+      "path": "experiments/fixed-weight-routing-20261104/patches/stable-target/engine-overlay__sglang__srt__managers__native_target_guard.py.patch",
+      "source": "project_b_candidates_20261103_04",
+      "source_path": "stable-target-candidate-20261103/patches/engine-overlay__sglang__srt__managers__native_target_guard.py.patch",
+      "source_sha256": "aa8cb5d953ba7c7922a252600e964ef196cc56bfca139cf79e018dea9e0910a7",
+      "public_sha256": "aa8cb5d953ba7c7922a252600e964ef196cc56bfca139cf79e018dea9e0910a7",
+      "bytes": 6884,
+      "normalizations": []
+    },
+    {
+      "path": "experiments/fixed-weight-routing-20261104/patches/stable-target/engine-overlay__sglang__srt__managers__scheduler.py.patch",
+      "source": "project_b_candidates_20261103_04",
+      "source_path": "stable-target-candidate-20261103/patches/engine-overlay__sglang__srt__managers__scheduler.py.patch",
+      "source_sha256": "8839633c2cd75a912c8258ba06796127185b7e1e7a2dcd3147460fe8eb159789",
+      "public_sha256": "8839633c2cd75a912c8258ba06796127185b7e1e7a2dcd3147460fe8eb159789",
+      "bytes": 1279,
+      "normalizations": []
+    },
+    {
+      "path": "experiments/fixed-weight-routing-20261104/patches/stable-target/engine-overlay__sglang__srt__managers__tokenizer_manager.py.patch",
+      "source": "project_b_candidates_20261103_04",
+      "source_path": "stable-target-candidate-20261103/patches/engine-overlay__sglang__srt__managers__tokenizer_manager.py.patch",
+      "source_sha256": "bf5c74839ede5fcb319b2010f7c83a6f8a5f73d0a40927dc3ecb0f97f191b85a",
+      "public_sha256": "bf5c74839ede5fcb319b2010f7c83a6f8a5f73d0a40927dc3ecb0f97f191b85a",
+      "bytes": 951,
+      "normalizations": []
+    },
+    {
+      "path": "experiments/fixed-weight-routing-20261104/patches/stable-target/gateway-source__src__routers__http__mod.rs.patch",
+      "source": "project_b_candidates_20261103_04",
+      "source_path": "stable-target-candidate-20261103/patches/gateway-source__src__routers__http__mod.rs.patch",
+      "source_sha256": "2e7cc9b85f771082545ba1273a8ff2e331882077c661de1d0cc7c104352435c8",
+      "public_sha256": "2e7cc9b85f771082545ba1273a8ff2e331882077c661de1d0cc7c104352435c8",
+      "bytes": 184,
+      "normalizations": []
+    },
+    {
+      "path": "experiments/fixed-weight-routing-20261104/patches/stable-target/gateway-source__src__routers__http__router.rs.patch",
+      "source": "project_b_candidates_20261103_04",
+      "source_path": "stable-target-candidate-20261103/patches/gateway-source__src__routers__http__router.rs.patch",
+      "source_sha256": "599e9f01b5c522f95b35961ba98c3e274438aae6a2375f2ef94974156bcb3f66",
+      "public_sha256": "599e9f01b5c522f95b35961ba98c3e274438aae6a2375f2ef94974156bcb3f66",
+      "bytes": 21161,
+      "normalizations": []
+    },
+    {
+      "path": "experiments/fixed-weight-routing-20261104/patches/stable-target/gateway-source__src__routers__http__stable_target.rs.patch",
+      "source": "project_b_candidates_20261103_04",
+      "source_path": "stable-target-candidate-20261103/patches/gateway-source__src__routers__http__stable_target.rs.patch",
+      "source_sha256": "839fcd99cb8f34272c10465509dad0ea90fd04e9dc345987de504e21178525a8",
+      "public_sha256": "839fcd99cb8f34272c10465509dad0ea90fd04e9dc345987de504e21178525a8",
+      "bytes": 2952,
+      "normalizations": []
+    },
+    {
+      "path": "experiments/fixed-weight-routing-20261104/patches/stable-target/source__tests__trainer__ppo__v1__test_native_target_guard_on_cpu.py.patch",
+      "source": "project_b_candidates_20261103_04",
+      "source_path": "stable-target-candidate-20261103/patches/source__tests__trainer__ppo__v1__test_native_target_guard_on_cpu.py.patch",
+      "source_sha256": "c37045537a2e99535853da3d60cfa6e8ac0ed608563f3ea1df93edcebe4859a8",
+      "public_sha256": "c37045537a2e99535853da3d60cfa6e8ac0ed608563f3ea1df93edcebe4859a8",
+      "bytes": 9419,
+      "normalizations": []
+    },
+    {
+      "path": "experiments/fixed-weight-routing-20261104/patches/stable-target/source__verl__trainer__ppo__v1__trajectory_state__kv_route_advice.py.patch",
+      "source": "project_b_candidates_20261103_04",
+      "source_path": "stable-target-candidate-20261103/patches/source__verl__trainer__ppo__v1__trajectory_state__kv_route_advice.py.patch",
+      "source_sha256": "1d946e0eef1d611938050ca94b37a5a0f8d92cca131ffc863bc5548531df2cd1",
+      "public_sha256": "1d946e0eef1d611938050ca94b37a5a0f8d92cca131ffc863bc5548531df2cd1",
+      "bytes": 1065,
+      "normalizations": []
+    },
+    {
+      "path": "experiments/fixed-weight-routing-20261104/README.md",
+      "source": "routing_result_summary_20261104",
+      "source_path": "README.md",
+      "source_sha256": "bc39a66462347d66235ad2a806e8177ac1f1a7322fe6212e6df9bea543ec9e6e",
+      "public_sha256": "bc39a66462347d66235ad2a806e8177ac1f1a7322fe6212e6df9bea543ec9e6e",
+      "bytes": 3397,
+      "normalizations": [
+        "sanitized aggregate summary; no raw private receipts"
+      ]
+    },
+    {
+      "path": "experiments/fixed-weight-routing-20261104/results.json",
+      "source": "routing_result_summary_20261104",
+      "source_path": "results.json",
+      "source_sha256": "55de2827c9b3b46833bfff61fe89d83782bc21d267f53cb9fe893b5f820a1126",
+      "public_sha256": "55de2827c9b3b46833bfff61fe89d83782bc21d267f53cb9fe893b5f820a1126",
+      "bytes": 2650,
+      "normalizations": [
+        "sanitized aggregate summary; no raw private receipts"
+      ]
     }
   ],
   "excluded": [

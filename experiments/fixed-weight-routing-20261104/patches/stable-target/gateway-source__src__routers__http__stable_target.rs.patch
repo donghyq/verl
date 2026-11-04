@@ -1,0 +1,94 @@
+--- a/gateway-source/src/routers/http/stable_target.rs
++++ b/gateway-source/src/routers/http/stable_target.rs
+@@ -0,0 +1,91 @@
++//! Opt-in opaque registered-worker selection. Missing hints keep the native policy.
++
++#[derive(Debug, PartialEq, Eq)]
++pub(crate) enum StableTargetError {
++    Disabled,
++    InvalidId,
++    NotRegistered,
++    UnavailableOrWrongModel,
++}
++
++pub(crate) fn select_registered_target<T>(
++    requested: Option<&str>,
++    enabled: bool,
++    resolve: impl FnOnce(&str) -> Option<T>,
++    eligible: impl FnOnce(&T) -> bool,
++) -> Result<Option<T>, StableTargetError> {
++    let Some(id) = requested else { return Ok(None) };
++    if !enabled {
++        return Err(StableTargetError::Disabled);
++    }
++    if id.is_empty() || id.len() > 256 {
++        return Err(StableTargetError::InvalidId);
++    }
++    let worker = resolve(id).ok_or(StableTargetError::NotRegistered)?;
++    if !eligible(&worker) {
++        return Err(StableTargetError::UnavailableOrWrongModel);
++    }
++    Ok(Some(worker))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::collections::HashMap;
++
++    #[test]
++    fn absent_target_does_not_resolve_or_change_default_policy() {
++        let value = select_registered_target::<u32>(
++            None,
++            false,
++            |_| panic!("must not resolve"),
++            |_| panic!("must not inspect"),
++        );
++        assert_eq!(value, Ok(None));
++    }
++
++    #[test]
++    fn target_is_an_opaque_id_independent_of_array_order() {
++        let members = HashMap::from([("registered-a", 8u32), ("registered-b", 2u32)]);
++        for id in ["registered-b", "registered-a"] {
++            assert_eq!(
++                select_registered_target(Some(id), true, |key| members.get(key).copied(), |_| true),
++                Ok(members.get(id).copied())
++            );
++        }
++    }
++
++    #[test]
++    fn disabled_hint_does_not_resolve_or_fall_back() {
++        assert_eq!(
++            select_registered_target::<u32>(Some("id"), false, |_| panic!("disabled"), |_| true),
++            Err(StableTargetError::Disabled)
++        );
++    }
++
++    #[test]
++    fn removed_id_is_rejected_without_another_worker() {
++        assert_eq!(
++            select_registered_target::<u32>(Some("removed"), true, |_| None, |_| true),
++            Err(StableTargetError::NotRegistered)
++        );
++    }
++
++    #[test]
++    fn unavailable_or_wrong_model_is_rejected() {
++        assert_eq!(
++            select_registered_target(Some("id"), true, |_| Some(3u32), |_| false),
++            Err(StableTargetError::UnavailableOrWrongModel)
++        );
++    }
++
++    #[test]
++    fn malformed_id_is_rejected_before_lookup() {
++        for id in [String::new(), "x".repeat(257)] {
++            assert_eq!(
++                select_registered_target::<u32>(Some(&id), true, |_| panic!("invalid"), |_| true),
++                Err(StableTargetError::InvalidId)
++            );
++        }
++    }
++}

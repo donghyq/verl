@@ -1,0 +1,511 @@
+--- a/gateway-source/src/routers/http/router.rs
++++ b/gateway-source/src/routers/http/router.rs
+@@ -10,6 +10,9 @@
+ use futures_util::{stream, StreamExt};
+ use reqwest::Client;
+ use tracing::{debug, error};
++
++use super::stable_target::select_registered_target;
++use crate::core::worker_registry::WorkerId;
+ 
+ use crate::{
+     app_context::AppContext,
+@@ -51,6 +54,7 @@
+     dp_aware: bool,
+     enable_igw: bool,
+     retry_config: RetryConfig,
++    stable_target_enabled: bool,
+ }
+ 
+ impl std::fmt::Debug for Router {
+@@ -76,6 +80,8 @@
+             dp_aware: ctx.router_config.dp_aware,
+             enable_igw: ctx.router_config.enable_igw,
+             retry_config: ctx.router_config.effective_retry_config(),
++            stable_target_enabled: std::env::var("SGLANG_ENABLE_STABLE_TARGET_ROUTING").as_deref()
++                == Ok("1"),
+         })
+     }
+ 
+@@ -214,37 +220,60 @@
+             bool_to_static_str(is_stream),
+         );
+ 
+-        let response = RetryExecutor::execute_response_with_retry(
+-            &self.retry_config,
+-            // operation per attempt
+-            |_: u32| async {
+-                let res = self
+-                    .route_typed_request_once(headers, typed_req, route, model_id, is_stream, &text)
+-                    .await;
+-
+-                // Need to be outside `route_typed_request_once` because that function has multiple return paths
+-                Metrics::record_router_upstream_response(
+-                    metrics_labels::ROUTER_HTTP,
+-                    res.status().as_u16(),
+-                    extract_error_code_from_response(&res),
+-                );
+-
+-                res
+-            },
+-            // should_retry predicate
+-            |res, _attempt| is_retryable_status(res.status()),
+-            // on_backoff hook
+-            |delay, attempt| {
+-                // Layer 3 worker metrics
+-                Metrics::record_worker_retry(metrics_labels::WORKER_REGULAR, endpoint);
+-                Metrics::record_worker_retry_backoff(attempt, delay);
+-            },
+-            // on_exhausted hook
+-            || {
+-                Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_REGULAR, endpoint);
+-            },
+-        )
+-        .await;
++        let targeted = headers
++            .map(|h| {
++                h.contains_key("x-smg-target-worker-id") || h.contains_key("x-sglang-native-target")
++            })
++            .unwrap_or(false);
++        let response = if targeted {
++            // A transport failure can hide accepted generation. Never replay a targeted request here.
++            let response = self
++                .route_typed_request_once(headers, typed_req, route, model_id, is_stream, &text)
++                .await;
++            Metrics::record_router_upstream_response(
++                metrics_labels::ROUTER_HTTP,
++                response.status().as_u16(),
++                extract_error_code_from_response(&response),
++            );
++            response
++        } else {
++            RetryExecutor::execute_response_with_retry(
++                &self.retry_config,
++                // operation per attempt
++                |_: u32| async {
++                    let res = self
++                        .route_typed_request_once(
++                            headers, typed_req, route, model_id, is_stream, &text,
++                        )
++                        .await;
++
++                    // Need to be outside `route_typed_request_once` because that function has multiple return paths
++                    Metrics::record_router_upstream_response(
++                        metrics_labels::ROUTER_HTTP,
++                        res.status().as_u16(),
++                        extract_error_code_from_response(&res),
++                    );
++
++                    res
++                },
++                // should_retry predicate
++                |res, _attempt| is_retryable_status(res.status()),
++                // on_backoff hook
++                |delay, attempt| {
++                    // Layer 3 worker metrics
++                    Metrics::record_worker_retry(metrics_labels::WORKER_REGULAR, endpoint);
++                    Metrics::record_worker_retry_backoff(attempt, delay);
++                },
++                // on_exhausted hook
++                || {
++                    Metrics::record_worker_retries_exhausted(
++                        metrics_labels::WORKER_REGULAR,
++                        endpoint,
++                    );
++                },
++            )
++            .await
++        };
+ 
+         if response.status().is_success() {
+             let duration = start.elapsed();
+@@ -270,6 +299,60 @@
+         response
+     }
+ 
++    fn select_stable_worker(
++        &self,
++        model_id: Option<&str>,
++        headers: Option<&HeaderMap>,
++    ) -> Result<Option<Arc<dyn Worker>>, Response> {
++        let worker_hint = headers.and_then(|h| h.get("x-smg-target-worker-id"));
++        let native_hint = headers.and_then(|h| h.get("x-sglang-native-target"));
++        if worker_hint.is_none() && native_hint.is_none() {
++            return Ok(None);
++        }
++        let error = |message: &str| {
++            error::create_error(
++                StatusCode::CONFLICT,
++                "native_target_rejected_before_admission",
++                message,
++            )
++        };
++        if worker_hint.is_none() || native_hint.is_none() {
++            return Err(error(
++                "stable worker ID and native target proof must both be present",
++            ));
++        }
++        let id = worker_hint
++            .unwrap()
++            .to_str()
++            .map_err(|_| error("invalid stable worker ID"))?;
++        if native_hint.unwrap().to_str().is_err() {
++            return Err(error("invalid native target proof header"));
++        }
++        let effective_model_id = if self.enable_igw { model_id } else { None };
++        let candidates = self.worker_registry.get_workers_filtered(
++            effective_model_id,
++            Some(WorkerType::Regular),
++            Some(ConnectionMode::Http),
++            None,
++            false,
++        );
++        select_registered_target(
++            Some(id),
++            self.stable_target_enabled,
++            |id| {
++                self.worker_registry
++                    .get(&WorkerId::from_string(id.to_owned()))
++            },
++            |worker| {
++                worker.is_available()
++                    && candidates
++                        .iter()
++                        .any(|candidate| Arc::ptr_eq(candidate, worker))
++            },
++        )
++        .map_err(|cause| error(&format!("stable worker target unavailable: {cause:?}")))
++    }
++
+     async fn route_typed_request_once<T: GenerationRequest + serde::Serialize + Clone>(
+         &self,
+         headers: Option<&HeaderMap>,
+@@ -279,17 +362,35 @@
+         is_stream: bool,
+         text: &str,
+     ) -> Response {
+-        let worker = match self
+-            .select_worker_for_model(model_id, Some(text), headers)
+-            .await
++        if route != "/generate"
++            && headers
++                .map(|h| {
++                    h.contains_key("x-smg-target-worker-id")
++                        || h.contains_key("x-sglang-native-target")
++                })
++                .unwrap_or(false)
+         {
+-            Some(w) => w,
+-            None => {
+-                return error::service_unavailable(
+-                    "no_available_workers",
+-                    "No available workers (all circuits open or unhealthy)",
+-                );
+-            }
++            return error::create_error(
++                StatusCode::CONFLICT,
++                "native_target_rejected_before_admission",
++                "stable native targets are supported only by the /generate admission path",
++            );
++        }
++        let worker = match self.select_stable_worker(model_id, headers) {
++            Ok(Some(worker)) => worker,
++            Err(response) => return response,
++            Ok(None) => match self
++                .select_worker_for_model(model_id, Some(text), headers)
++                .await
++            {
++                Some(worker) => worker,
++                None => {
++                    return error::service_unavailable(
++                        "no_available_workers",
++                        "No available workers (all circuits open or unhealthy)",
++                    )
++                }
++            },
+         };
+ 
+         let policy = match model_id {
+@@ -557,7 +658,14 @@
+ 
+         if let Some(headers) = headers {
+             for (name, value) in headers {
+-                if header_utils::should_forward_request_header(name.as_str()) {
++                // The native header allowlist intentionally excludes arbitrary X headers.
++                // Forward this proof only after the stable /generate selection checks.
++                let native_target_proof = self.stable_target_enabled
++                    && route == "/generate"
++                    && headers.contains_key("x-smg-target-worker-id")
++                    && name.as_str() == "x-sglang-native-target";
++                if header_utils::should_forward_request_header(name.as_str()) || native_target_proof
++                {
+                     request_builder = request_builder.header(name, value);
+                 }
+             }
+@@ -855,6 +963,64 @@
+ mod tests {
+     use super::*;
+     use crate::core::BasicWorkerBuilder;
++    use std::sync::atomic::{AtomicUsize, Ordering};
++
++    async fn mock_http_worker(
++        status: StatusCode,
++    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
++        let calls = Arc::new(AtomicUsize::new(0));
++        let counter = calls.clone();
++        let app = axum::Router::new().route(
++            "/generate",
++            axum::routing::post(
++                move |headers: HeaderMap, Json(body): Json<serde_json::Value>| {
++                    let counter = counter.clone();
++                    async move {
++                        counter.fetch_add(1, Ordering::SeqCst);
++                    let payload = serde_json::json!({
++                                "native_target_header": headers.get("x-sglang-native-target")
++                                    .and_then(|value| value.to_str().ok()),
++                            "internal_target_id_forwarded": headers.contains_key("x-smg-target-worker-id"),
++                                "forwarded_input_ids": body.get("input_ids"),
++                        });
++                    if body.get("stream").and_then(serde_json::Value::as_bool) == Some(true) {
++                        (status, [(CONTENT_TYPE, "text/event-stream")],
++                         format!("data: {payload}\n\ndata: [DONE]\n\n")).into_response()
++                    } else {
++                        (status, Json(payload)).into_response()
++                    }
++                    }
++                },
++            ),
++        );
++        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let url = format!("http://{}", listener.local_addr().unwrap());
++        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
++        (url, calls, server)
++    }
++
++    fn register_http_worker(router: &Router, url: &str) -> WorkerId {
++        router.worker_registry.register(Arc::new(
++            BasicWorkerBuilder::new(url)
++                .worker_type(WorkerType::Regular)
++                .build(),
++        ))
++    }
++
++    fn generate_request() -> GenerateRequest {
++        serde_json::from_value(serde_json::json!({
++            "input_ids": [11, 12],
++            "sampling_params": {"max_new_tokens": 1, "temperature": 0},
++            "stream": false,
++        }))
++        .unwrap()
++    }
++
++    fn clear_test_workers(router: &Router) {
++        for (id, _) in router.worker_registry.get_all_with_ids() {
++            router.worker_registry.remove(&id);
++        }
++    }
+ 
+     fn create_test_regular_router() -> Router {
+         // Create registries
+@@ -880,6 +1046,7 @@
+             client: Client::new(),
+             retry_config: RetryConfig::default(),
+             enable_igw: false,
++            stable_target_enabled: false,
+         }
+     }
+ 
+@@ -923,4 +1090,193 @@
+         let worker = router.worker_registry.get_by_url(&url).unwrap();
+         assert!(worker.is_healthy());
+     }
++    #[test]
++    fn test_stable_worker_id_survives_registry_order_changes_and_rejects_removal() {
++        let mut router = create_test_regular_router();
++        router.stable_target_enabled = true;
++        let (id, worker) = router.worker_registry.get_all_with_ids().pop().unwrap();
++        let mut headers = HeaderMap::new();
++        headers.insert("x-smg-target-worker-id", id.as_str().parse().unwrap());
++        headers.insert("x-sglang-native-target", "{}".parse().unwrap());
++        let selected = router
++            .select_stable_worker(None, Some(&headers))
++            .unwrap()
++            .unwrap();
++        assert!(Arc::ptr_eq(&selected, &worker));
++        router.worker_registry.remove(&id);
++        let rejected = router
++            .select_stable_worker(None, Some(&headers))
++            .unwrap_err();
++        assert_eq!(rejected.status(), StatusCode::CONFLICT);
++    }
++
++    #[test]
++    fn test_stable_worker_hints_fail_closed_and_missing_hint_keeps_native_policy() {
++        let mut router = create_test_regular_router();
++        assert!(router.select_stable_worker(None, None).unwrap().is_none());
++        let (id, _) = router.worker_registry.get_all_with_ids().pop().unwrap();
++        let mut headers = HeaderMap::new();
++        headers.insert("x-smg-target-worker-id", id.as_str().parse().unwrap());
++        assert_eq!(
++            router
++                .select_stable_worker(None, Some(&headers))
++                .unwrap_err()
++                .status(),
++            StatusCode::CONFLICT
++        );
++        headers.insert("x-sglang-native-target", "{}".parse().unwrap());
++        assert_eq!(
++            router
++                .select_stable_worker(None, Some(&headers))
++                .unwrap_err()
++                .status(),
++            StatusCode::CONFLICT
++        );
++        router.stable_target_enabled = true;
++        router.enable_igw = true;
++        assert_eq!(
++            router
++                .select_stable_worker(Some("not-the-registered-model"), Some(&headers))
++                .unwrap_err()
++                .status(),
++            StatusCode::CONFLICT
++        );
++    }
++
++    #[tokio::test]
++    async fn test_targeted_http_dispatch_preserves_proof_and_never_falls_back_after_removal() {
++        let mut router = create_test_regular_router();
++        clear_test_workers(&router);
++        router.stable_target_enabled = true;
++        let (url_a, calls_a, server_a) = mock_http_worker(StatusCode::OK).await;
++        let (url_b, calls_b, server_b) = mock_http_worker(StatusCode::OK).await;
++        register_http_worker(&router, &url_a);
++        let id_b = register_http_worker(&router, &url_b);
++        let proof = r#"{"schema_version":1,"policy_version":"1"}"#;
++        let mut headers = HeaderMap::new();
++        headers.insert("x-smg-target-worker-id", id_b.as_str().parse().unwrap());
++        headers.insert("x-sglang-native-target", proof.parse().unwrap());
++        let request = generate_request();
++
++        let response = router
++            .route_typed_request(Some(&headers), &request, "/generate", None)
++            .await;
++        assert_eq!(response.status(), StatusCode::OK);
++        let body = to_bytes(response.into_body(), 4096).await.unwrap();
++        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
++        assert_eq!(body["native_target_header"], proof);
++        assert_eq!(body["internal_target_id_forwarded"], false);
++        assert_eq!(body["forwarded_input_ids"], serde_json::json!([11, 12]));
++        assert_eq!(calls_a.load(Ordering::SeqCst), 0);
++        assert_eq!(calls_b.load(Ordering::SeqCst), 1);
++
++        router.worker_registry.remove(&id_b);
++        let response = router
++            .route_typed_request(Some(&headers), &request, "/generate", None)
++            .await;
++        assert_eq!(response.status(), StatusCode::CONFLICT);
++        assert_eq!(calls_a.load(Ordering::SeqCst), 0);
++        assert_eq!(calls_b.load(Ordering::SeqCst), 1);
++        server_a.abort();
++        server_b.abort();
++    }
++
++    #[tokio::test]
++    async fn test_targeted_stream_preserves_proof_to_the_selected_backend() {
++        let mut router = create_test_regular_router();
++        clear_test_workers(&router);
++        router.stable_target_enabled = true;
++        let (url, calls, server) = mock_http_worker(StatusCode::OK).await;
++        let id = register_http_worker(&router, &url);
++        let proof = r#"{"schema_version":1,"policy_version":"1"}"#;
++        let mut headers = HeaderMap::new();
++        headers.insert("x-smg-target-worker-id", id.as_str().parse().unwrap());
++        headers.insert("x-sglang-native-target", proof.parse().unwrap());
++        let request: GenerateRequest = serde_json::from_value(serde_json::json!({
++            "input_ids": [11, 12], "sampling_params": {"max_new_tokens": 1}, "stream": true,
++        }))
++        .unwrap();
++        let response = router
++            .route_typed_request(Some(&headers), &request, "/generate", None)
++            .await;
++        assert_eq!(response.status(), StatusCode::OK);
++        let body = to_bytes(response.into_body(), 4096).await.unwrap();
++        let text = std::str::from_utf8(&body).unwrap();
++        let first = text
++            .lines()
++            .find_map(|line| line.strip_prefix("data: "))
++            .unwrap();
++        let payload: serde_json::Value = serde_json::from_str(first).unwrap();
++        assert_eq!(payload["native_target_header"], proof);
++        assert_eq!(payload["internal_target_id_forwarded"], false);
++        assert_eq!(calls.load(Ordering::SeqCst), 1);
++        server.abort();
++    }
++
++    #[tokio::test]
++    async fn test_targeted_http_failure_is_not_retried_or_reassigned() {
++        let mut router = create_test_regular_router();
++        clear_test_workers(&router);
++        router.stable_target_enabled = true;
++        router.retry_config.max_retries = 2;
++        router.retry_config.initial_backoff_ms = 1;
++        let (url_a, calls_a, server_a) = mock_http_worker(StatusCode::OK).await;
++        let (url_b, calls_b, server_b) = mock_http_worker(StatusCode::SERVICE_UNAVAILABLE).await;
++        register_http_worker(&router, &url_a);
++        let id_b = register_http_worker(&router, &url_b);
++        let mut headers = HeaderMap::new();
++        headers.insert("x-smg-target-worker-id", id_b.as_str().parse().unwrap());
++        headers.insert("x-sglang-native-target", "{}".parse().unwrap());
++        let response = router
++            .route_typed_request(Some(&headers), &generate_request(), "/generate", None)
++            .await;
++        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
++        assert_eq!(calls_a.load(Ordering::SeqCst), 0);
++        assert_eq!(calls_b.load(Ordering::SeqCst), 1);
++        server_a.abort();
++        server_b.abort();
++    }
++
++    #[tokio::test]
++    async fn test_target_hint_on_unsupported_endpoint_is_rejected_without_forwarding() {
++        let mut router = create_test_regular_router();
++        clear_test_workers(&router);
++        router.stable_target_enabled = true;
++        let (url, calls, server) = mock_http_worker(StatusCode::OK).await;
++        let id = register_http_worker(&router, &url);
++        let mut headers = HeaderMap::new();
++        headers.insert("x-smg-target-worker-id", id.as_str().parse().unwrap());
++        headers.insert("x-sglang-native-target", "{}".parse().unwrap());
++        let response = router
++            .route_typed_request(
++                Some(&headers),
++                &generate_request(),
++                "/v1/chat/completions",
++                None,
++            )
++            .await;
++        assert_eq!(response.status(), StatusCode::CONFLICT);
++        assert_eq!(calls.load(Ordering::SeqCst), 0);
++        server.abort();
++    }
++
++    #[tokio::test]
++    async fn test_ordinary_http_request_keeps_native_round_robin() {
++        let router = create_test_regular_router();
++        clear_test_workers(&router);
++        let (url_a, calls_a, server_a) = mock_http_worker(StatusCode::OK).await;
++        let (url_b, calls_b, server_b) = mock_http_worker(StatusCode::OK).await;
++        register_http_worker(&router, &url_a);
++        register_http_worker(&router, &url_b);
++        for _ in 0..2 {
++            let response = router
++                .route_typed_request(None, &generate_request(), "/generate", None)
++                .await;
++            assert_eq!(response.status(), StatusCode::OK);
++        }
++        assert_eq!(calls_a.load(Ordering::SeqCst), 1);
++        assert_eq!(calls_b.load(Ordering::SeqCst), 1);
++        server_a.abort();
++        server_b.abort();
++    }
+ }

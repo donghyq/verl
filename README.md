@@ -12,7 +12,11 @@
 | 可靠产物存储、Mooncake 载荷、处理租约及传输成本 | [历史存储与数据面组件](components/legacy_storage_data_plane/)、[独立租约恢复组件](components/lease_recovery/) | 与当前原生训练快照分开。不能把 Mooncake SDK/组件验证说成当前 35B 数据面已使用 Mooncake |
 | 物理缓存接管、训练更新和源 GPU 复用的检查 | [原生训练与观测代码](runtime/native/native-training/)、[生产 SGLang 恢复扩展](runtime/sglang/) | 功能路径和观测路径并列；检查器存在不代表其验收条件已经通过 |
 | 完整训练 Checkpoint 与恢复净成本 | [保存与加载候选](candidates/checkpoint/)、[成本统计候选](candidates/recovery_net_cost/) | 保存模型、优化器和训练进度的完整 3→4 恢复待验证；没有有效、工作量等价的收益结论 |
-| 最近一次问题定位、路由探索 | [诊断代码](diagnostics/)、[隔离的 CPU 路由仿真](experiments/group_routing/) | 诊断不进入训练；仿真不算生产性能结果，也不扩入当前 P0 |
+| 最近一次问题定位、路由探索 | [诊断代码](diagnostics/)、[隔离的 CPU 路由仿真](experiments/group_routing/) | 诊断不进入训练；仿真不算生产性能结果。最新固定权重 GPU 筛选另见下文 |
+
+## 最新性能和质量验证（2026-11-04）
+
+[固定权重路由源码快照及实验](experiments/fixed-weight-routing-20261104/README.md)记录三组 GPU 配对、原生缓存对照和 8K 质量条件。组件确认合并吞吐 +4.32%，计入该窗口成本后 +0.619%；实际优化器更新为 0，尚未证明 RL 正收益。旧训练单对和恢复负结果继续保留。
 
 ## 按请求流阅读
 

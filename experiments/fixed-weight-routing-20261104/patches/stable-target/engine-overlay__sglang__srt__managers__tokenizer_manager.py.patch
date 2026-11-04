@@ -1,0 +1,20 @@
+--- a/engine-overlay/sglang/srt/managers/tokenizer_manager.py
++++ b/engine-overlay/sglang/srt/managers/tokenizer_manager.py
+@@ -777,6 +777,9 @@
+ 
+             prepare_portable_generate_input(obj)
+         obj.normalize_batch_and_arguments()
++        if isinstance(obj, GenerateReqInput) and obj.native_target is not None:
++            from sglang.srt.managers.native_target_guard import prepare_targeted_generate_input
++            prepare_targeted_generate_input(obj)
+         self._set_default_priority(obj)
+         if (
+             isinstance(obj, GenerateReqInput)
+@@ -1464,6 +1467,7 @@
+                 mm_data_mooncake=obj.mm_data_mooncake,
+                 encoder_urls=obj.encoder_urls,
+                 token_kv_restore=obj.token_kv_restore,
++                native_target=obj.native_target,
+             )
+         elif isinstance(obj, EmbeddingReqInput):
+             # Resolve unresolved embed overrides now that input_ids are available

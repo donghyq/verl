@@ -1,0 +1,54 @@
+--- a/sglang/srt/managers/schedule_batch.py
++++ b/sglang/srt/managers/schedule_batch.py
+@@ -2652,7 +2652,14 @@
+             # to force the math calculation to retrieve the correct mamba state from h.
+             return i + 1
+ 
++        strict_prefill_checkpoint = (
++            get_exec().deterministic.enable_deterministic_inference
++        )
+         mask = req.extend_range.length >= checkpoint_grid
++        if strict_prefill_checkpoint:
++            # Intermediate h is BF16 on this frozen runtime. Only the final
++            # FP32 state at a complete checkpoint grid is reusable here.
++            mask = mask and req.extend_range.length % checkpoint_grid == 0
+         track_index = req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx].item()
+         mamba_track_seqlen = -1
+         if mask:
+@@ -2695,7 +2702,7 @@
+                         req.mamba_next_track_idx
+                     )
+                 )
+-            if req.mamba_branching_seqlen is not None:
++            if req.mamba_branching_seqlen is not None and not strict_prefill_checkpoint:
+                 # track branching point in this forward if the branching point
+                 # is within the current extend batch.
+                 branching_seqlen_aligned_mask = (
+@@ -3092,6 +3099,8 @@
+ 
+         if mamba_extra_buffer_enabled():
+             mamba_track_interval = get_exec().mamba.mamba_track_interval
++            # Reusable checkpoints must retain the prefill computation path.
++            track_decode = not get_exec().deterministic.enable_deterministic_inference
+ 
+             if len(self.reqs) == 0:
+                 self.mamba_track_indices = torch.empty(
+@@ -3099,15 +3108,15 @@
+                 )
+                 self.mamba_track_buffer_indices = []
+             else:
+-                if mamba_extra_buffer_lazy_enabled():
++                if mamba_extra_buffer_lazy_enabled() and track_decode:
+                     self.mamba_lazy_prealloc_at_boundary(mamba_track_interval)
+                 set_mamba_track_indices_from_reqs(self)
+ 
+             track_remainders_cpu = self.seq_lens_cpu % mamba_track_interval
+-            track_mask_cpu = track_remainders_cpu == 0
++            track_mask_cpu = (track_remainders_cpu == 0) & track_decode
+             self.mamba_track_mask_cpu = track_mask_cpu.tolist()
+             self.mamba_track_mask_next_cpu = (
+-                (track_remainders_cpu == mamba_track_interval - 1).tolist()
++                ((track_remainders_cpu == mamba_track_interval - 1) & track_decode).tolist()
+                 if self.enable_overlap
+                 else None
+             )
